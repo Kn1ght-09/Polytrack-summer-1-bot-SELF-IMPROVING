@@ -8,6 +8,8 @@ const MODE = "drive";
 // true  = the bot keeps trying slightly different lines and speeds, keeps what is faster, and restarts the level
 //         (with the T key) when a try is slower or crashes. false = plain driving, like version 0.3.11.
 const LEARN = true;
+const SPEED_VALUE = 0.8;    // how much extra km/h at a checkpoint counts as saved time (0 = ignore speed, 1 = full credit)
+const MAX_LINE_SHIFT = 2.5; // the learned line may move at most this many metres sideways from your recorded line
 const AUTO_RESTART = true;  // let the mod press T for you. If it doesn't work in your game, set false and press T yourself.
 const AUTO_START = true;    // after a restart, the mod also taps forward to start the race
 const AUTO_START_MS = 100;  // how long the forward tap lasts (milliseconds). Keep it as short as works.
@@ -150,6 +152,9 @@ const WORKER_HELPERS = `
   const SLOW_ZONES = ${JSON.stringify(SLOW_ZONES)};
   const LOOK_BASE = ${LOOK_BASE};
   const LEARN = ${LEARN};
+  const MAX_LINE_SHIFT = ${MAX_LINE_SHIFT};
+  const SPEED_VALUE = ${SPEED_VALUE};
+  const AVG_MS = 55;   // typical speed in m/s, used to turn extra km/h into saved time
   const LOOK_SPEED = ${LOOK_SPEED};
   const LOOK_MAX = ${LOOK_MAX};
   const DECODE_OFFSET = ${DECODE_OFFSET};
@@ -287,7 +292,7 @@ const WORKER_HELPERS = `
 
   // ================= SELF-LEARNING =================
   const ch = (typeof BroadcastChannel !== "undefined") ? new BroadcastChannel("ptbot") : null;
-  const L = bot.learn = { best:{cp:[],seg:[],dur:[],vexit:[]}, cur:{seg:[]}, run:null, runNo:0, pending:false, pendingFrame:0 };
+  const L = bot.learn = { best:{cp:[],seg:[],dur:[],vexit:[],offs:new Array(N).fill(0)}, cur:{seg:[],offs:new Array(N).fill(0)}, run:null, runNo:0, pending:false, pendingFrame:0 };
   const DEF = {sp:1, off:0, br:6};
   function clampv(v,a,b) { return Math.max(a,Math.min(b,v)); }
   function rnd(a) { return (Math.random()*2-1)*a; }
@@ -306,6 +311,19 @@ const WORKER_HELPERS = `
   function paramsAt(i) {
     if(!LEARN) return DEF;
     return L.cur.seg[segOf(i)] || DEF;
+  }
+
+  // Sideways shift (metres, + = right) of the learned line at a route point.
+  function offAt(k) {
+    if(!LEARN) return 0;
+    return L.cur.offs[Math.max(0,Math.min(N-1,k))] || 0;
+  }
+  // Route points belonging to stretch s: [lo, hi)
+  function rangeOf(s) {
+    const cp=L.best.cp;
+    const lo=s>0 && cp[s-1] ? cp[s-1].idx : 0;
+    const hi=cp[s] ? Math.max(cp[s].idx,lo+1) : N;
+    return [lo,Math.min(hi,N)];
   }
 
   function requestRestart(delay,why,frames) {
@@ -332,24 +350,41 @@ const WORKER_HELPERS = `
     }
     // Only stretches that have been driven before can be tested against a known time.
     const maxS=Math.min(B.dur.length,seg.length);
+    const offs=B.offs.slice();
     const mutated=[];
+    const desc=[];
     if(LEARN && maxS>0) {
       for(let s=0;s<maxS;s++) { if(Math.random()<0.4) mutated.push(s); }
       if(!mutated.length) mutated.push(Math.floor(Math.random()*maxS));
       for(const s of mutated) {
         const g=seg[s];
-        const n=Math.random()<0.2 ? 2 : 1;
-        for(let k=0;k<n;k++) {
-          const w=Math.floor(Math.random()*3);
-          if(w===0) g.sp=clampv(g.sp+rnd(0.03),0.8,1.12);
-          else if(w===1) g.off=clampv(g.off+rnd(0.5),-2,2);
-          else g.br=clampv(g.br+rnd(1),3,10);
+        const n=Math.random()<0.25 ? 2 : 1;
+        for(let t=0;t<n;t++) {
+          const w=Math.random();
+          if(w<0.2) { g.sp=clampv(g.sp+rnd(0.03),0.8,1.12); desc.push("speed x"+g.sp.toFixed(2)+" in stretch "+(s+1)); }
+          else if(w<0.4) { g.br=clampv(g.br+rnd(1),3,10); desc.push("braking "+g.br.toFixed(1)+" in stretch "+(s+1)); }
+          else {
+            // Reshape the line: a smooth sideways bump somewhere in this stretch.
+            const r=rangeOf(s);
+            const span=r[1]-r[0];
+            if(span>=8) {
+              const c=r[0]+Math.random()*span;
+              const wd=3+Math.random()*10;
+              const amp=rnd(0.7);
+              for(let j=r[0];j<r[1];j++) {
+                const edge=Math.min(1,(j-r[0])/6,(r[1]-1-j)/6);
+                const bump=amp*Math.exp(-((j-c)*(j-c))/(2*wd*wd))*Math.max(0,edge);
+                offs[j]=clampv(offs[j]+bump,-MAX_LINE_SHIFT,MAX_LINE_SHIFT);
+              }
+              desc.push("line "+(amp>0?"right ":"left ")+Math.abs(amp).toFixed(1)+" m near point "+Math.round(c));
+            }
+          }
         }
       }
     }
-    L.cur={seg:seg};
+    L.cur={seg:seg, offs:offs};
     L.run={n:L.runNo, cps:[], mut:mutated, failed:false};
-    console.log("PTBOT_LEARN run "+L.runNo+": "+B.dur.length+" stretches known, trying changes in stretch "+(mutated.length ? mutated.join(",") : "none (measuring baseline)"));
+    console.log("PTBOT_LEARN run "+L.runNo+": "+B.dur.length+" stretches known, trying: "+(desc.length ? desc.join("; ") : "nothing (measuring baseline)"));
   }
 
   // Called when the car passes a checkpoint (or finishes).
@@ -375,19 +410,26 @@ const WORKER_HELPERS = `
 
     const dt=dur-B.dur[k];
     const dv=speed-B.vexit[k];
-    const worse = dt>3 || dv<-4;
-    const improved = !worse && (dt<-3 || dv>3);
+    // Extra speed at the end of a stretch pays off over the rest of the lap, so it counts as saved time.
+    let remFrames=0;
+    for(let j=k+1;j<B.dur.length;j++) remFrames+=B.dur[j];
+    const credit=SPEED_VALUE*clampv(dv,-20,20)/3.6*remFrames/AVG_MS;
+    const dEff=dt-credit;
+    const worse = dEff>3 || dt>250;
+    const improved = !worse && dEff<-3;
     if(worse) {
-      console.log("PTBOT_LEARN "+name+": WORSE (stretch "+(dt>0?"+":"")+dt+" frames, speed "+(dv>0?"+":"")+Math.round(dv)+" km/h) -> restarting");
+      console.log("PTBOT_LEARN "+name+": WORSE (stretch "+(dt>0?"+":"")+dt+" frames, speed "+(dv>0?"+":"")+Math.round(dv)+" km/h, counts as "+(dEff>0?"+":"")+Math.round(dEff)+" frames) -> restarting");
       failRun("slower or lower speed at "+name, state);
       return;
     }
     if(improved) {
       const c=L.cur.seg[k] || DEF;
-      B.seg[k]={sp:c.sp, off:c.off, br:c.br};
+      B.seg[k]={sp:c.sp, off:0, br:c.br};
+      const rg=rangeOf(k);
+      for(let j=rg[0];j<rg[1];j++) B.offs[j]=Math.round(L.cur.offs[j]*100)/100;
       B.dur[k]=dur;
       B.vexit[k]=speed;
-      console.log("PTBOT_LEARN "+name+": BETTER (stretch "+dt+" frames, speed "+(dv>0?"+":"")+Math.round(dv)+" km/h) -> kept, carrying on");
+      console.log("PTBOT_LEARN "+name+": BETTER (stretch "+dt+" frames, speed "+(dv>0?"+":"")+Math.round(dv)+" km/h, counts as "+Math.round(dEff)+" frames) -> kept, carrying on");
       saveBest();
       console.log("PTBOT_LEARN_STATE", JSON.stringify(B));
     } else {
@@ -398,7 +440,7 @@ const WORKER_HELPERS = `
   if(ch) {
     ch.onmessage=(ev) => {
       const m=ev.data || {};
-      if(m.type==="load" && m.data && m.data.n===N && m.data.best && Array.isArray(m.data.best.dur) && L.best.cp.length===0 && L.runNo<=1) {
+      if(m.type==="load" && m.data && m.data.n===N && m.data.best && Array.isArray(m.data.best.dur) && Array.isArray(m.data.best.offs) && m.data.best.offs.length===N && L.best.cp.length===0 && L.runNo<=1) {
         L.best=m.data.best;
         console.log("PTBOT_LEARN loaded saved progress: "+L.best.dur.length+" stretches known");
         L.runNo=0;
@@ -567,12 +609,12 @@ const WORKER_HELPERS = `
     const ld=Math.max(LOOK_BASE,Math.min(LOOK_MAX,LOOK_BASE+speed*LOOK_SPEED));
     let target=lookAhead(state.position,ld,i);
     if(LEARN) {
-      const Pt=paramsAt(target.index);
-      if(Pt.off) {
+      const toff=offAt(target.index);
+      if(toff) {
         const k=Math.max(1,Math.min(N-1,target.index));
         const ddx=ROUTE[k][0]-ROUTE[k-1][0], ddz=ROUTE[k][2]-ROUTE[k-1][2];
         const ll=Math.hypot(ddx,ddz)||1;
-        target={x:target.x+Pt.off*(-ddz/ll), y:target.y, z:target.z+Pt.off*(ddx/ll), index:target.index};
+        target={x:target.x+toff*(-ddz/ll), y:target.y, z:target.z+toff*(ddx/ll), index:target.index};
       }
     }
 
@@ -603,7 +645,7 @@ const WORKER_HELPERS = `
 
     if(abs>1.0 && speed>60) up=false;
 
-    const lat=lateral(state.position,i)-(LEARN ? paramsAt(i).off : 0);
+    const lat=lateral(state.position,i)-(LEARN ? offAt(i) : 0);
     const s=Math.max(-1,Math.min(1,(angle+LINE_PULL*Math.max(-8,Math.min(8,lat)))*STEER_GAIN*(1+LOW_SPEED_BOOST*Math.max(0,1-speed/150))*STEER_SIGN));
     let e=(bot.acc[id] ?? 0)+s;
     let right=false;
@@ -829,7 +871,7 @@ const BOT_BODY = `
 function setupMainThread() {
   if (typeof BroadcastChannel === "undefined") return;
   const ch = new BroadcastChannel("ptbot");
-  const STORE = "ptbot_learn_v2";
+  const STORE = "ptbot_learn_v3";
 
   function fire(type, k) {
     const ev = new KeyboardEvent(type, {
@@ -871,7 +913,7 @@ class TutorialBot extends PolyMod {
     this.modName = "PolyTrack Tutorial Bot";
     this.modAuthor = "Kn1ght-09";
     this.modID = "polytrack-tutorial-bot";
-    this.modVersion = "0.4.2";
+    this.modVersion = "0.4.3";
     this.touchingPhysics = true;
   }
 
