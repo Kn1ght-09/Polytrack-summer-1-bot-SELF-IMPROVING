@@ -8,6 +8,17 @@ const MODE = "drive";
 // true  = the bot keeps trying slightly different lines and speeds, keeps what is faster, and restarts the level
 //         (with the T key) when a try is slower or crashes. false = plain driving, like version 0.3.11.
 const LEARN = true;
+
+// ---- AIRBRAKE (smooth landings) ----
+// In the air the bot uses the brake/forward keys to tilt the car so its wheels land flat on the slope it is about to hit.
+const AIRBRAKE = true;
+const AIR_DELAY = 120;            // only after this many frames in the air (ignores tiny bumps)
+const AIR_MATCH_SLOPE = false;    // false: level the car flat (parallel to the world's ground). true: match the slope of the recorded route instead.
+const AIR_BIAS = 0;               // radians; positive = land a bit more nose-up than the slope (try 0.05 to 0.15)
+const AIR_DOWN_IS_NOSE_UP = true; // true: brake tilts the car back (nose up). If the car tilts the wrong way in the air, set false.
+const AIR_LEAD = 80;              // looks this many frames ahead when judging the tilt
+const AIR_DEADBAND = 0.05;        // radians of tilt error to ignore
+const AIR_LOOK_SEC = 0.36;        // how far ahead (in seconds of travel) it looks for the slope it will land on
 const SPEED_VALUE = 0.8;    // how much extra km/h at a checkpoint counts as saved time (0 = ignore speed, 1 = full credit)
 const MAX_LINE_SHIFT = 2.5; // the learned line may move at most this many metres sideways from your recorded line
 const AUTO_RESTART = true;  // let the mod press T for you. If it doesn't work in your game, set false and press T yourself.
@@ -152,6 +163,14 @@ const WORKER_HELPERS = `
   const SLOW_ZONES = ${JSON.stringify(SLOW_ZONES)};
   const LOOK_BASE = ${LOOK_BASE};
   const LEARN = ${LEARN};
+  const AIRBRAKE = ${AIRBRAKE};
+  const AIR_DELAY = ${AIR_DELAY};
+  const AIR_MATCH_SLOPE = ${AIR_MATCH_SLOPE};
+  const AIR_BIAS = ${AIR_BIAS};
+  const AIR_DOWN_IS_NOSE_UP = ${AIR_DOWN_IS_NOSE_UP};
+  const AIR_LEAD = ${AIR_LEAD};
+  const AIR_DEADBAND = ${AIR_DEADBAND};
+  const AIR_LOOK_SEC = ${AIR_LOOK_SEC};
   const MAX_LINE_SHIFT = ${MAX_LINE_SHIFT};
   const SPEED_VALUE = ${SPEED_VALUE};
   const AVG_MS = 55;   // typical speed in m/s, used to turn extra km/h into saved time
@@ -173,6 +192,10 @@ const WORKER_HELPERS = `
     lastCrash: Object.create(null),
     lastOff: Object.create(null),
     lastCp: Object.create(null),
+    airSince: Object.create(null),
+    airV0: Object.create(null),
+    lastPitch: Object.create(null),
+    airMatched: Object.create(null),
     finLogged: Object.create(null),
     dbg: null,
     recRun: 0,
@@ -293,7 +316,7 @@ const WORKER_HELPERS = `
   // ================= SELF-LEARNING =================
   const ch = (typeof BroadcastChannel !== "undefined") ? new BroadcastChannel("ptbot") : null;
   const L = bot.learn = { best:{cp:[],seg:[],dur:[],vexit:[],offs:new Array(N).fill(0)}, cur:{seg:[],offs:new Array(N).fill(0)}, run:null, runNo:0, pending:false, pendingFrame:0 };
-  const DEF = {sp:1, off:0, br:6};
+  const DEF = {sp:1, off:0, br:6, ab:0};
   function clampv(v,a,b) { return Math.max(a,Math.min(b,v)); }
   function rnd(a) { return (Math.random()*2-1)*a; }
   function post(m) { if(ch) { try { ch.postMessage(m); } catch(_) {} } }
@@ -346,7 +369,7 @@ const WORKER_HELPERS = `
     const seg=[];
     for(let s=0;s<Math.max(B.cp.length,1);s++) {
       const p=B.seg[s] || DEF;
-      seg.push({sp:p.sp, off:p.off, br:p.br});
+      seg.push({sp:p.sp, off:0, br:p.br, ab:p.ab||0});
     }
     // Only stretches that have been driven before can be tested against a known time.
     const maxS=Math.min(B.dur.length,seg.length);
@@ -361,8 +384,9 @@ const WORKER_HELPERS = `
         const n=Math.random()<0.25 ? 2 : 1;
         for(let t=0;t<n;t++) {
           const w=Math.random();
-          if(w<0.2) { g.sp=clampv(g.sp+rnd(0.03),0.8,1.12); desc.push("speed x"+g.sp.toFixed(2)+" in stretch "+(s+1)); }
-          else if(w<0.4) { g.br=clampv(g.br+rnd(1),3,10); desc.push("braking "+g.br.toFixed(1)+" in stretch "+(s+1)); }
+          if(w<0.18) { g.sp=clampv(g.sp+rnd(0.03),0.8,1.12); desc.push("speed x"+g.sp.toFixed(2)+" in stretch "+(s+1)); }
+          else if(w<0.36) { g.br=clampv(g.br+rnd(1),3,10); desc.push("braking "+g.br.toFixed(1)+" in stretch "+(s+1)); }
+          else if(w<0.5 && AIRBRAKE) { g.ab=clampv((g.ab||0)+rnd(0.06),-0.35,0.35); desc.push("landing tilt "+g.ab.toFixed(2)+" rad in stretch "+(s+1)); }
           else {
             // Reshape the line: a smooth sideways bump somewhere in this stretch.
             const r=rangeOf(s);
@@ -424,7 +448,7 @@ const WORKER_HELPERS = `
     }
     if(improved) {
       const c=L.cur.seg[k] || DEF;
-      B.seg[k]={sp:c.sp, off:0, br:c.br};
+      B.seg[k]={sp:c.sp, off:0, br:c.br, ab:c.ab||0};
       const rg=rangeOf(k);
       for(let j=rg[0];j<rg[1];j++) B.offs[j]=Math.round(L.cur.offs[j]*100)/100;
       B.dur[k]=dur;
@@ -451,6 +475,19 @@ const WORKER_HELPERS = `
   }
   if(LEARN) startRun();
   // =================================================
+
+  // Slope of the ground (radians, negative = downhill) a short way ahead, taken from the recorded route.
+  function groundPitch(i,speedKmh) {
+    const D=Math.max(8,speedKmh/3.6*AIR_LOOK_SEC);
+    let acc=0, j=i;
+    while(j<N-1 && acc<D) {
+      acc+=Math.hypot(ROUTE[j+1][0]-ROUTE[j][0],ROUTE[j+1][2]-ROUTE[j][2]);
+      j++;
+    }
+    const k=Math.max(1,j);
+    const dh=Math.hypot(ROUTE[k][0]-ROUTE[k-1][0],ROUTE[k][2]-ROUTE[k-1][2])||1;
+    return Math.atan2(ROUTE[k][1]-ROUTE[k-1][1],dh);
+  }
 
   function targetSpeed(i) {
     let best=Infinity;
@@ -531,6 +568,7 @@ const WORKER_HELPERS = `
       frames,
       speedKmh:speed,
       hasStarted:!!(flags&1),
+      wheels:(flags>>3)&15,
       finishFrames:finish,
       nextCheckpointIndex:checkpoint,
       hasCheckpointToRespawnAt:!!(flags&4),
@@ -747,6 +785,47 @@ const WORKER_HELPERS = `
       lat:+lat.toFixed(1)
     };
 
+    // ---- airborne handling ----
+    const airborne=(state.wheels===0);
+    const pitch=Math.asin(Math.max(-1,Math.min(1,f.y)));
+    if(airborne) {
+      if(bot.airSince[id]===undefined) { bot.airSince[id]=state.frames; bot.airV0[id]=speed; bot.airMatched[id]=false; }
+    } else if(bot.airSince[id]!==undefined) {
+      const t=state.frames-bot.airSince[id];
+      if(t>300) {
+        console.log("PTBOT_JUMP","airtime="+t+" frames","speed "+Math.round(bot.airV0[id])+"->"+Math.round(speed),"landing tilt="+(pitch*57.3).toFixed(0)+" deg","ground="+(groundPitch(i,speed)*57.3).toFixed(0)+" deg","idx="+i);
+      }
+      bot.airSince[id]=undefined;
+      bot.airMatched[id]=false;
+    }
+    const airFor=airborne ? state.frames-bot.airSince[id] : 0;
+    const prevPitch=bot.lastPitch[id];
+    bot.lastPitch[id]=pitch;
+    if(airborne && airFor>AIR_DELAY) {
+      // no steering in the air; tilt to match the landing slope
+      right=false; left=false;
+      if(AIRBRAKE) {
+        const rate=(prevPitch===undefined) ? 0 : (pitch-prevPitch);   // per step
+        const want=(AIR_MATCH_SLOPE ? groundPitch(i,speed) : 0)+AIR_BIAS+(LEARN ? (paramsAt(i).ab||0) : 0);
+        const predicted=pitch+rate*AIR_LEAD;
+        const e=want-predicted;     // positive = nose needs to come up
+        up=false; down=false;
+        const err2=want-pitch;      // actual tilt error right now
+        // Once the car is level with the slope, stop. Only start again if it drifts clearly away.
+        if(bot.airMatched[id]) {
+          if(Math.abs(err2)>AIR_DEADBAND*3) bot.airMatched[id]=false;
+        } else if(Math.abs(err2)<AIR_DEADBAND) {
+          bot.airMatched[id]=true;
+        }
+        if(!bot.airMatched[id]) {
+          // never push the nose further once the actual tilt has reached the wanted tilt
+          if(e>AIR_DEADBAND && err2>0.02) { if(AIR_DOWN_IS_NOSE_UP) down=true; else up=true; }
+          else if(e<-AIR_DEADBAND && err2<-0.02) { if(AIR_DOWN_IS_NOSE_UP) up=true; else down=true; }
+        }
+        bot.dbg.air={t:airFor,pitch:+pitch.toFixed(2),want:+want.toFixed(2),level:!!bot.airMatched[id]};
+      }
+    }
+
     return {up,right,down,left,reset};
   }
 
@@ -871,7 +950,7 @@ const BOT_BODY = `
 function setupMainThread() {
   if (typeof BroadcastChannel === "undefined") return;
   const ch = new BroadcastChannel("ptbot");
-  const STORE = "ptbot_learn_v3";
+  const STORE = "ptbot_learn_v4";
 
   function fire(type, k) {
     const ev = new KeyboardEvent(type, {
@@ -913,7 +992,7 @@ class TutorialBot extends PolyMod {
     this.modName = "PolyTrack Tutorial Bot";
     this.modAuthor = "Kn1ght-09";
     this.modID = "polytrack-tutorial-bot";
-    this.modVersion = "0.4.3";
+    this.modVersion = "0.4.5";
     this.touchingPhysics = true;
   }
 
