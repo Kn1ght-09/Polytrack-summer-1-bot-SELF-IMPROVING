@@ -287,7 +287,7 @@ const WORKER_HELPERS = `
 
   // ================= SELF-LEARNING =================
   const ch = (typeof BroadcastChannel !== "undefined") ? new BroadcastChannel("ptbot") : null;
-  const L = bot.learn = { best:{cp:[],seg:[],valid:0}, cur:{seg:[]}, run:null, runNo:0, pending:false, pendingFrame:0 };
+  const L = bot.learn = { best:{cp:[],seg:[],dur:[],vexit:[]}, cur:{seg:[]}, run:null, runNo:0, pending:false, pendingFrame:0 };
   const DEF = {sp:1, off:0, br:6};
   function clampv(v,a,b) { return Math.max(a,Math.min(b,v)); }
   function rnd(a) { return (Math.random()*2-1)*a; }
@@ -327,11 +327,11 @@ const WORKER_HELPERS = `
     const B=L.best;
     const seg=[];
     for(let s=0;s<Math.max(B.cp.length,1);s++) {
-      const b=B.seg[s] || DEF;
-      seg.push({sp:b.sp, off:b.off, br:b.br});
+      const p=B.seg[s] || DEF;
+      seg.push({sp:p.sp, off:p.off, br:p.br});
     }
-    // Only stretches whose checkpoint times are already known can be tested.
-    const maxS=Math.min(B.valid,seg.length);
+    // Only stretches that have been driven before can be tested against a known time.
+    const maxS=Math.min(B.dur.length,seg.length);
     const mutated=[];
     if(LEARN && maxS>0) {
       for(let s=0;s<maxS;s++) { if(Math.random()<0.4) mutated.push(s); }
@@ -349,54 +349,58 @@ const WORKER_HELPERS = `
     }
     L.cur={seg:seg};
     L.run={n:L.runNo, cps:[], mut:mutated, failed:false};
-    console.log("PTBOT_LEARN run "+L.runNo+": "+B.cp.length+" checkpoints known, "+B.valid+" confirmed, trying changes in stretch "+(mutated.length ? mutated.join(",") : "none (measuring baseline)"));
+    console.log("PTBOT_LEARN run "+L.runNo+": "+B.dur.length+" stretches known, trying changes in stretch "+(mutated.length ? mutated.join(",") : "none (measuring baseline)"));
   }
 
   // Called when the car passes a checkpoint (or finishes).
+  // Each stretch (start -> checkpoint 1, checkpoint 1 -> checkpoint 2, ...) is judged on its own:
+  // how long it took and how fast the car was at the end of it.
   function onCheckpoint(frames,speed,idx,isFinish,state) {
     if(!LEARN || !L.run || L.run.failed || L.pending) return;
     const R=L.run, B=L.best, k=R.cps.length;
+    const prevFrames=k>0 ? R.cps[k-1].frames : 0;
+    const dur=frames-prevFrames;
     R.cps.push({frames:frames, speed:speed, idx:idx});
     const name=isFinish ? "finish" : "checkpoint "+(k+1);
 
-    if(k>=B.valid) {
-      // Nothing to compare with yet: this becomes the reference.
-      B.cp[k]={frames:frames, speed:speed, idx:idx};
-      B.valid=k+1;
-      console.log("PTBOT_LEARN reference set at "+name+": frames="+frames+" speed="+Math.round(speed));
+    if(k>=B.dur.length) {
+      // First time this stretch is driven: it becomes the reference.
+      B.cp[k]={idx:idx};
+      B.dur[k]=dur;
+      B.vexit[k]=speed;
+      console.log("PTBOT_LEARN reference set at "+name+": stretch took "+dur+" frames, speed "+Math.round(speed)+" km/h");
       saveBest();
       return;
     }
 
-    const ref=B.cp[k];
-    const dt=frames-ref.frames;
-    const dv=speed-ref.speed;
+    const dt=dur-B.dur[k];
+    const dv=speed-B.vexit[k];
     const worse = dt>3 || dv<-4;
     const improved = !worse && (dt<-3 || dv>3);
     if(worse) {
-      console.log("PTBOT_LEARN "+name+": WORSE (time "+(dt>0?"+":"")+dt+" frames, speed "+(dv>0?"+":"")+Math.round(dv)+" km/h)");
+      console.log("PTBOT_LEARN "+name+": WORSE (stretch "+(dt>0?"+":"")+dt+" frames, speed "+(dv>0?"+":"")+Math.round(dv)+" km/h) -> restarting");
       failRun("slower or lower speed at "+name, state);
       return;
     }
     if(improved) {
-      B.seg[k]={sp:L.cur.seg[k].sp, off:L.cur.seg[k].off, br:L.cur.seg[k].br};
-      B.cp[k]={frames:frames, speed:speed, idx:ref.idx};
-      B.valid=k+1;                    // later reference times are now out of date
-      console.log("PTBOT_LEARN "+name+": BETTER (time "+dt+" frames, speed "+(dv>0?"+":"")+Math.round(dv)+" km/h) -> kept");
+      const c=L.cur.seg[k] || DEF;
+      B.seg[k]={sp:c.sp, off:c.off, br:c.br};
+      B.dur[k]=dur;
+      B.vexit[k]=speed;
+      console.log("PTBOT_LEARN "+name+": BETTER (stretch "+dt+" frames, speed "+(dv>0?"+":"")+Math.round(dv)+" km/h) -> kept, carrying on");
       saveBest();
       console.log("PTBOT_LEARN_STATE", JSON.stringify(B));
-      if(!isFinish) requestRestart(300,"new best at "+name+", re-measuring the rest",state.frames);
     } else {
-      console.log("PTBOT_LEARN "+name+": same as best");
+      console.log("PTBOT_LEARN "+name+": same as best, carrying on");
     }
   }
 
   if(ch) {
     ch.onmessage=(ev) => {
       const m=ev.data || {};
-      if(m.type==="load" && m.data && m.data.n===N && m.data.best && L.best.cp.length===0 && L.runNo<=1) {
+      if(m.type==="load" && m.data && m.data.n===N && m.data.best && Array.isArray(m.data.best.dur) && L.best.cp.length===0 && L.runNo<=1) {
         L.best=m.data.best;
-        console.log("PTBOT_LEARN loaded saved progress: "+L.best.cp.length+" checkpoints, "+L.best.valid+" confirmed");
+        console.log("PTBOT_LEARN loaded saved progress: "+L.best.dur.length+" stretches known");
         L.runNo=0;
         startRun();
       }
@@ -825,7 +829,7 @@ const BOT_BODY = `
 function setupMainThread() {
   if (typeof BroadcastChannel === "undefined") return;
   const ch = new BroadcastChannel("ptbot");
-  const STORE = "ptbot_learn_v1";
+  const STORE = "ptbot_learn_v2";
 
   function fire(type, k) {
     const ev = new KeyboardEvent(type, {
@@ -867,7 +871,7 @@ class TutorialBot extends PolyMod {
     this.modName = "PolyTrack Tutorial Bot";
     this.modAuthor = "Kn1ght-09";
     this.modID = "polytrack-tutorial-bot";
-    this.modVersion = "0.4.1";
+    this.modVersion = "0.4.2";
     this.touchingPhysics = true;
   }
 
