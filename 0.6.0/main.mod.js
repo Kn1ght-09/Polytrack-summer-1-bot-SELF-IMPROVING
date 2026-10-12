@@ -1,4 +1,3 @@
-
 import { PolyMod, MixinType } from "https://cdn.polymodloader.com/cb/PolyTrackMods/PolyModLoader/0.6.3/PolyTypes.js";
 
 // "drive" = the bot drives the recorded lap.
@@ -923,10 +922,31 @@ const BOT_BODY = `
   }
 `;
 
+function rlog(s) {
+  try { (window.__ptReconLines=window.__ptReconLines||[]).push(s); } catch (_) {}
+  console.log(s);
+}
+
+function ptDownload(name,text) {
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([text],{type:"text/plain"}));
+  a.download=name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(()=>a.remove(),500);
+}
+
+// In the console: ptReconDump() saves all recon lines as a file; ptWorkerSource(0) saves the physics worker's code.
+window.ptReconDump=()=>ptDownload("ptbot_recon.txt",(window.__ptReconLines||[]).join("\n"));
+window.ptWorkerSource=(id)=>{
+  const e=(window.__ptWorkers||[])[id||0];
+  if(e && e.src) ptDownload("ptbot_worker_"+(id||0)+".js",e.src); else console.log("no source saved for that worker yet");
+};
+
 function reconSummary(v,d) {
   if(v===null || v===undefined) return String(v);
   const t=typeof v;
-  if(t==="string") return JSON.stringify(v.length>60?v.slice(0,60)+"...("+v.length+" chars)":v);
+  if(t==="string") return JSON.stringify(v.length>300?v.slice(0,300)+"...("+v.length+" chars)":v);
   if(t==="number" || t==="boolean") return String(v);
   if(t==="function") return "fn";
   if(v instanceof ArrayBuffer) return "ArrayBuffer("+v.byteLength+")";
@@ -936,13 +956,13 @@ function reconSummary(v,d) {
     return v.constructor.name+"("+v.length+")["+head+(v.length>12?",...":"")+"]";
   }
   if(Array.isArray(v)) {
-    if(d>=3) return "Array("+v.length+")";
+    if(d>=5) return "Array("+v.length+")";
     return "Array("+v.length+")["+v.slice(0,3).map(x=>reconSummary(x,d+1)).join(", ")+(v.length>3?", ...":"")+"]";
   }
   if(t==="object") {
-    if(d>=3) return "{...}";
+    if(d>=5) return "{...}";
     const ks=Object.keys(v);
-    return "{"+ks.slice(0,14).map(k=>k+": "+reconSummary(v[k],d+1)).join(", ")+(ks.length>14?", ...("+ks.length+" keys)":"")+"}";
+    return "{"+ks.slice(0,30).map(k=>k+": "+reconSummary(v[k],d+1)).join(", ")+(ks.length>30?", ...("+ks.length+" keys)":"")+"}";
   }
   return t;
 }
@@ -957,12 +977,12 @@ function installRecon() {
     const id=window.__ptWorkers.length;
     const entry={w,url:String(url),opts};
     window.__ptWorkers.push(entry);
-    console.log("PTBOT_RECON worker #"+id+" created: "+String(url).slice(0,140)+" options="+JSON.stringify(opts||{}));
+    rlog("PTBOT_RECON worker #"+id+" created: "+String(url).slice(0,140)+" options="+JSON.stringify(opts||{}));
     try {
       if(String(url).indexOf("blob:")===0) {
         fetch(url).then(r=>r.text()).then(txt=>{
           entry.src=txt;
-          console.log("PTBOT_RECON worker #"+id+" source is "+txt.length+" characters long");
+          rlog("PTBOT_RECON worker #"+id+" source is "+txt.length+" characters long");
         }).catch(()=>{});
       }
     } catch (_) {}
@@ -970,17 +990,17 @@ function installRecon() {
     let nOut=0,nIn=0;
     w.postMessage=function(m,t) {
       nOut++;
-      if(nOut<=40 || nOut%500===0) console.log("PTBOT_RECON #"+id+" game -> worker, message "+nOut+": "+reconSummary(m,0));
+      if(nOut<=40 || nOut%500===0) rlog("PTBOT_RECON #"+id+" game -> worker, message "+nOut+": "+reconSummary(m,0));
       return origPost(m,t);
     };
     w.addEventListener("message",ev=>{
       nIn++;
-      if(nIn<=40 || nIn%500===0) console.log("PTBOT_RECON #"+id+" worker -> game, message "+nIn+": "+reconSummary(ev.data,0));
+      if(nIn<=40 || nIn%500===0) rlog("PTBOT_RECON #"+id+" worker -> game, message "+nIn+": "+reconSummary(ev.data,0));
     });
     return w;
   };
   window.Worker.prototype=OrigWorker.prototype;
-  console.log("PTBOT_RECON installed (watching for physics workers)");
+  rlog("PTBOT_RECON installed (watching for physics workers)");
 }
 
 function setupMainThread() {
@@ -1030,7 +1050,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.5.6";
+    this.modVersion="0.6.0";
     this.touchingPhysics=true;
   }
 
