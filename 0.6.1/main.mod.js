@@ -1,3 +1,4 @@
+
 import { PolyMod, MixinType } from "https://cdn.polymodloader.com/cb/PolyTrackMods/PolyModLoader/0.6.3/PolyTypes.js";
 
 // "drive" = the bot drives the recorded lap.
@@ -884,6 +885,48 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     }
   }
 
+  // ---- TRACK CAPTURE (research): reads the track the game gives the physics worker ----
+  const TRACK_LIB = Object.create(null);
+  function r3(v) { return Math.round(v*1000)/1000; }
+  function captureTrack(m) {
+    if(!m || typeof m!=="object") return;
+    if(m.messageType===0 && Array.isArray(m.trackParts)) {
+      for(const p of m.trackParts) TRACK_LIB[p.id]={v:p.vertices,detector:p.detector||null,startOffset:p.startOffset||null};
+      return;
+    }
+    if(m.messageType===3 && typeof m.trackData==="string" && m.carRecording==null) {
+      const track=Ko.fromSaveString(m.trackData);
+      if(!track) { console.log("PTBOT_TRACK could not read the track"); return; }
+      const parts=[], used=Object.create(null);
+      track.forEachPart((x,y,z,id,rot,axis,color,cpo,so)=>{
+        const q=eo[axis][rot];
+        parts.push([x,y,z,id,rot,axis,cpo==null?-1:cpo,so==null?-1:so,r3(q.x),r3(q.y),r3(q.z),r3(q.w)]);
+        used[id]=true;
+      });
+      const lib={};
+      for(const id of Object.keys(used)) {
+        const e=TRACK_LIB[id];
+        if(!e) continue;
+        lib[id]={v:Array.from(e.v,r3),detector:e.detector,startOffset:e.startOffset};
+      }
+      let start=null, cps=null, fins=null;
+      try { const st=track.getStartTransform(); start={p:[st.position.x,st.position.y,st.position.z],q:[st.quaternion.x,st.quaternion.y,st.quaternion.z,st.quaternion.w]}; } catch(_) {}
+      try { cps=track.getCheckpoints(); } catch(_) {}
+      try { fins=track.getFinishes(); } catch(_) {}
+      const data={partSize:Lo.partSize,parts:parts,lib:lib,start:start,checkpoints:cps,finishes:fins,
+        mountainOffset:m.mountainOffset||null};
+      post({type:"track",data:data});
+      console.log("PTBOT_TRACK sent: "+parts.length+" placed parts, "+Object.keys(lib).length+" part shapes");
+    }
+  }
+  try {
+    const origOnMessage=onmessage;
+    onmessage=function(ev) {
+      try { captureTrack(ev.data); } catch(err) { console.log("PTBOT_TRACK capture failed: "+String(err)); }
+      return origOnMessage.call(this,ev);
+    };
+  } catch(err) { console.log("PTBOT_TRACK hook failed: "+String(err)); }
+
   bot.record=record;
   bot.decode=decode;
   bot.choose=choose;
@@ -1009,6 +1052,11 @@ function setupMainThread() {
   const ch=new BroadcastChannel("ptbot");
   const STORE="ptbot_learn_v5";
 
+  window.ptTrackDump=()=>{
+    if(!window.__ptTrack) { console.log("no track captured yet - start a race first"); return; }
+    ptDownload("ptbot_track.json",JSON.stringify(window.__ptTrack));
+  };
+
   function fire(type,k) {
     const ev=new KeyboardEvent(type,{
       key:k.key,code:k.code,keyCode:k.keyCode,which:k.keyCode,bubbles:true,cancelable:true
@@ -1028,6 +1076,9 @@ function setupMainThread() {
         const d=localStorage.getItem(STORE);
         ch.postMessage({type:"load",data:d?JSON.parse(d):null});
       } catch (_) {}
+    } else if(m.type==="track") {
+      window.__ptTrack=m.data;
+      console.log("PTBOT_TRACK received on the page: "+m.data.parts.length+" parts, "+(m.data.checkpoints?m.data.checkpoints.length:0)+" checkpoints. Type ptTrackDump() to save it as a file.");
     } else if(m.type==="save") {
       try { localStorage.setItem(STORE,JSON.stringify(m.data)); } catch (_) {}
     } else if(m.type==="restart" && AUTO_RESTART) {
@@ -1050,7 +1101,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.6.0";
+    this.modVersion="0.6.1";
     this.touchingPhysics=true;
   }
 
