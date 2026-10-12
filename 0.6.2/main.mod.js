@@ -21,7 +21,7 @@ const AIR_LEAD = 40;
 const AIR_DEADBAND = 0.08;
 const AIR_LOOK_SEC = 0.36;
 
-const SPEED_VALUE = 1;
+const SPEED_VALUE = 0.8;
 const MAX_LINE_SHIFT = 6;
 const MAX_SPEED_SHIFT = 0.2;
 const EXPLORE_RUNS = 60;
@@ -291,6 +291,17 @@ const WORKER_HELPERS = `
       if(curv>kmax) kmax=curv;
     }
     CAP.push(kmax>1e-6 ? Math.sqrt(LAT_ACCEL/kmax)*3.6 : 1000);
+  }
+
+  // The recorded lap lost speed on every landing. A smoother landing keeps that speed, and the bot
+  // used to brake to match the slower recorded number. So after each sudden drop we keep the
+  // speed from just before it for a few points (corners are still limited by CAP below).
+  const SPD=ROUTE.map(p=>p[3]);
+  for(let k=1;k<N;k++) {
+    if(ROUTE[k-1][3]-ROUTE[k][3]>12) {
+      const keep=ROUTE[k-1][3];
+      for(let m=k;m<Math.min(N,k+10);m++) SPD[m]=Math.max(SPD[m],keep);
+    }
   }
 
   function lateral(p,i) {
@@ -566,7 +577,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       const Pj=paramsAt(j);
       let zc=1000;
       for(const z of SLOW_ZONES) { if(j>=z[0] && j<=z[1] && z[2]<zc) zc=z[2]; }
-      const v=Math.min(ROUTE[j][3]*SPEED_FACTOR*Pj.sp*(1+spdAt(j)),CAP[j],zc)+Pi.br*(j-i);
+      const v=Math.min(SPD[j]*SPEED_FACTOR*Pj.sp*(1+spdAt(j)),CAP[j],zc)+Pi.br*(j-i);
       if(v<best) best=v;
     }
     return Math.max(best,25);
@@ -895,6 +906,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       return;
     }
     if(m.messageType===3 && typeof m.trackData==="string" && m.carRecording==null) {
+      console.log("PTBOT_TRACK worker saw the track ("+m.trackData.length+" characters), reading it");
       const track=Ko.fromSaveString(m.trackData);
       if(!track) { console.log("PTBOT_TRACK could not read the track"); return; }
       const parts=[], used=Object.create(null);
@@ -915,7 +927,12 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       try { fins=track.getFinishes(); } catch(_) {}
       const data={partSize:Lo.partSize,parts:parts,lib:lib,start:start,checkpoints:cps,finishes:fins,
         mountainOffset:m.mountainOffset||null};
-      post({type:"track",data:data});
+      let clean=null;
+      try { clean=JSON.parse(JSON.stringify(data)); } catch(err) { console.log("PTBOT_TRACK could not copy: "+String(err)); }
+      if(clean) {
+        try { if(ch) ch.postMessage({type:"track",data:clean}); else console.log("PTBOT_TRACK no channel"); }
+        catch(err) { console.log("PTBOT_TRACK send failed: "+String(err)); }
+      }
       console.log("PTBOT_TRACK sent: "+parts.length+" placed parts, "+Object.keys(lib).length+" part shapes");
     }
   }
@@ -1030,8 +1047,25 @@ function installRecon() {
       }
     } catch (_) {}
     const origPost=w.postMessage.bind(w);
+    const rawPost=function(m) {
+      try {
+        if(m && m.messageType===0 && Array.isArray(m.trackParts) && !(window.__ptRaw && window.__ptRaw.parts)) {
+          window.__ptRaw=window.__ptRaw||{};
+          window.__ptRaw.version=m.version;
+          window.__ptRaw.parts=m.trackParts.map(p=>({id:p.id,v:Array.from(p.vertices,x=>Math.round(x*1000)/1000),
+            detector:p.detector||null,startOffset:p.startOffset||null}));
+          rlog("PTBOT_RECON saved the "+m.trackParts.length+" road piece shapes");
+        } else if(m && m.messageType===3 && typeof m.trackData==="string" && m.carRecording==null) {
+          window.__ptRaw=window.__ptRaw||{};
+          window.__ptRaw.trackData=m.trackData;
+          window.__ptRaw.mountainOffset=m.mountainOffset||null;
+          rlog("PTBOT_RECON saved the track code ("+m.trackData.length+" characters)");
+        }
+      } catch(err) { rlog("PTBOT_RECON raw save failed: "+String(err)); }
+    };
     let nOut=0,nIn=0;
     w.postMessage=function(m,t) {
+      rawPost(m);
       nOut++;
       if(nOut<=40 || nOut%500===0) rlog("PTBOT_RECON #"+id+" game -> worker, message "+nOut+": "+reconSummary(m,0));
       return origPost(m,t);
@@ -1053,8 +1087,12 @@ function setupMainThread() {
   const STORE="ptbot_learn_v5";
 
   window.ptTrackDump=()=>{
-    if(!window.__ptTrack) { console.log("no track captured yet - start a race first"); return; }
-    ptDownload("ptbot_track.json",JSON.stringify(window.__ptTrack));
+    if(!window.__ptTrack && !(window.__ptRaw && window.__ptRaw.trackData)) {
+      console.log("no track captured yet - start a race first (load the track, press start)");
+      return;
+    }
+    ptDownload("ptbot_track.json",JSON.stringify({decoded:window.__ptTrack||null,raw:window.__ptRaw||null}));
+    console.log("saved ptbot_track.json (decoded track: "+(window.__ptTrack?"yes":"no")+", raw track code: "+(window.__ptRaw&&window.__ptRaw.trackData?"yes":"no")+")");
   };
 
   function fire(type,k) {
@@ -1101,7 +1139,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.6.1";
+    this.modVersion="0.6.2";
     this.touchingPhysics=true;
   }
 
