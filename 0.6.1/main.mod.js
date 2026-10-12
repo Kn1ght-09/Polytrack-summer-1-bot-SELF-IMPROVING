@@ -21,7 +21,7 @@ const AIR_LEAD = 40;
 const AIR_DEADBAND = 0.08;
 const AIR_LOOK_SEC = 0.36;
 
-const SPEED_VALUE = 0.8;
+const SPEED_VALUE = 1;
 const MAX_LINE_SHIFT = 6;
 const MAX_SPEED_SHIFT = 0.2;
 const EXPLORE_RUNS = 60;
