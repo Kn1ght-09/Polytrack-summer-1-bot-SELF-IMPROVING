@@ -399,7 +399,21 @@ function generateRoute(dec, opt) {
         }
       }
     }
-    if (dst < 0) return null;
+    search.approx = false;
+    if (dst < 0) {
+      var gl = [];
+      for (var g1 = 0; g1 < n; g1++) if (goal[g1]) gl.push(g1);
+      var bestD = 1e18, bestN = -1;
+      for (var k1 = 0; k1 < n; k1++) {
+        if (dist[k1] > 1e17 || k1 === src) continue;
+        for (var h1 = 0; h1 < gl.length; h1++) {
+          var e1 = nx_(k1)-nx_(gl[h1]), e2 = nz_(k1)-nz_(gl[h1]), e3 = nodeY[k1]-nodeY[gl[h1]], d1 = e1*e1+e2*e2+e3*e3;
+          if (d1 < bestD) { bestD = d1; bestN = k1; }
+        }
+      }
+      if (bestN < 0) return null;
+      dst = bestN; search.approx = true;
+    }
     var path = [dst];
     while (path[path.length-1] !== src) path.push(prev[path[path.length-1]]);
     path.reverse();
@@ -459,6 +473,7 @@ function generateRoute(dec, opt) {
     var seg = search(src, gates[wk].flags);
     if (!seg) { partialWhy = "no way from the " + wps[wk].name + " to the " + wps[wk+1].name; break; }
     for (var sk = (path.length ? 1 : 0); sk < seg.length; sk++) path.push(seg[sk]);
+    if (search.approx) { partialWhy = "no way from the " + wps[wk].name + " to the " + wps[wk+1].name + " (drove as close as the road goes)"; break; }
     src = seg[seg.length-1]; reached = wk + 1;
   }
   if (!reached) return { ok: false, why: partialWhy };
@@ -1609,7 +1624,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.7.1";
+    this.modVersion="0.7.2";
     this.touchingPhysics=true;
   }
 
