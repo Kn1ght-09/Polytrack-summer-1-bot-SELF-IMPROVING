@@ -5,6 +5,12 @@ import { PolyMod, MixinType } from "https://cdn.polymodloader.com/cb/PolyTrackMo
 // "record" = you drive manually and the mod records the lap.
 const MODE = "drive";
 
+// Where the driving line comes from:
+//   "auto"      = use your recorded lap if it belongs to the loaded track, otherwise build a line from the track itself
+//   "recorded"  = always use the recorded lap
+//   "generated" = always build a line from the track itself (even on the track you recorded)
+const ROUTE_SOURCE = "auto";
+
 // ---- SELF-LEARNING ----
 const LEARN = true;
 
@@ -25,7 +31,7 @@ const SPEED_VALUE = 0.8;
 const MAX_LINE_SHIFT = 6;
 const MAX_SPEED_SHIFT = 0.2;
 const EXPLORE_RUNS = 60;
-const AUTO_RESTART = false;
+const AUTO_RESTART = true;
 const AUTO_START = true;
 const AUTO_START_MS = 100;
 const AUTO_START_DELAY = 700;
@@ -151,17 +157,375 @@ const ROUTE = [
   [-281.1,20.3,278.7,307],[-289.6,20.3,278.5,309]
 ];
 
+// Builds a driving line from the track pieces (runs inside the physics worker).
+// Self-contained: builds a driving line for any track. No outside references.
+// dec = { parts:[[x,y,z,id,rot,axis,cpo,so,qx,qy,qz,qw],...], lib:{id:{v:[...],detector,startOffset}}, start:{p:[x,y,z]} }
+function generateRoute(dec, opt) {
+  opt = opt || {};
+  var CELL = 1.0, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.3, VMAX = opt.vmax || 250;
+  var GRAV = 16.0, VH = 55.0;
+  var t0 = Date.now();
+
+  function qrot(q, x, y, z) {
+    var n = Math.sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]) || 1;
+    var qx=q[0]/n, qy=q[1]/n, qz=q[2]/n, qw=q[3]/n;
+    return [
+      (1-2*(qy*qy+qz*qz))*x + 2*(qx*qy-qz*qw)*y + 2*(qx*qz+qy*qw)*z,
+      2*(qx*qy+qz*qw)*x + (1-2*(qx*qx+qz*qz))*y + 2*(qy*qz-qx*qw)*z,
+      2*(qx*qz-qy*qw)*x + 2*(qy*qz+qx*qw)*y + (1-2*(qx*qx+qy*qy))*z
+    ];
+  }
+
+  // ---- 1. world triangles, split into upward faces (drivable) and steep faces (walls, curbs) ----
+  var ups = [], sides = [];
+  var minx = 1e9, minz = 1e9, maxx = -1e9, maxz = -1e9;
+  for (var pi = 0; pi < dec.parts.length; pi++) {
+    var p = dec.parts[pi];
+    var e = dec.lib[p[3]];
+    if (!e) continue;
+    var v = e.v, q = [p[8], p[9], p[10], p[11]];
+    var ox = p[0]*5, oy = p[1]*5, oz = p[2]*5;
+    for (var i = 0; i + 8 < v.length; i += 9) {
+      var a = qrot(q, v[i], v[i+1], v[i+2]), b = qrot(q, v[i+3], v[i+4], v[i+5]), c = qrot(q, v[i+6], v[i+7], v[i+8]);
+      a[0]+=ox; a[1]+=oy; a[2]+=oz; b[0]+=ox; b[1]+=oy; b[2]+=oz; c[0]+=ox; c[1]+=oy; c[2]+=oz;
+      var ux=b[0]-a[0], uy=b[1]-a[1], uz=b[2]-a[2], wx=c[0]-a[0], wy=c[1]-a[1], wz=c[2]-a[2];
+      var nx=uy*wz-uz*wy, ny=uz*wx-ux*wz, nz=ux*wy-uy*wx;
+      var L = Math.sqrt(nx*nx+ny*ny+nz*nz);
+      if (L < 1e-9) continue;
+      var tri = [a, b, c];
+      if (ny/L > 0.6) {
+        ups.push(tri);
+        for (var k = 0; k < 3; k++) {
+          if (tri[k][0] < minx) minx = tri[k][0]; if (tri[k][0] > maxx) maxx = tri[k][0];
+          if (tri[k][2] < minz) minz = tri[k][2]; if (tri[k][2] > maxz) maxz = tri[k][2];
+        }
+      } else if (Math.abs(ny/L) <= 0.6) sides.push(tri);
+    }
+  }
+  if (ups.length < 20) return { ok: false, why: "no road surfaces found" };
+  minx = Math.floor(minx) - 6; minz = Math.floor(minz) - 6; maxx = Math.ceil(maxx) + 6; maxz = Math.ceil(maxz) + 6;
+  var W = Math.floor((maxx-minx)/CELL) + 1, H = Math.floor((maxz-minz)/CELL) + 1;
+  if (W*H > 6000000) return { ok: false, why: "track too large" };
+
+  // ---- 2. height layers per 1 m cell ----
+  var cells = new Map();
+  function addSample(x, z, y) {
+    var cx = Math.floor((x-minx)/CELL), cz = Math.floor((z-minz)/CELL);
+    if (cz < 0 || cz >= H || cx < 0 || cx >= W) return;
+    var key = cx*H + cz, arr = cells.get(key);
+    if (!arr) { cells.set(key, [y]); return; }
+    for (var m = 0; m < arr.length; m++) {
+      if (Math.abs(arr[m]-y) <= 0.5) { if (y > arr[m]) arr[m] = y; return; }
+    }
+    arr.push(y);
+  }
+  var S = 0.5;
+  for (var t = 0; t < ups.length; t++) {
+    var A = ups[t][0], B = ups[t][1], C = ups[t][2];
+    var x0 = Math.min(A[0],B[0],C[0]), x1 = Math.max(A[0],B[0],C[0]);
+    var z0 = Math.min(A[2],B[2],C[2]), z1 = Math.max(A[2],B[2],C[2]);
+    var d = (B[2]-C[2])*(A[0]-C[0]) + (C[0]-B[0])*(A[2]-C[2]);
+    if (Math.abs(d) < 1e-9) continue;
+    for (var gx = Math.floor(x0/S)*S + S/2; gx < x1 + S; gx += S) {
+      for (var gz = Math.floor(z0/S)*S + S/2; gz < z1 + S; gz += S) {
+        var al = ((B[2]-C[2])*(gx-C[0]) + (C[0]-B[0])*(gz-C[2]))/d;
+        var be = ((C[2]-A[2])*(gx-C[0]) + (A[0]-C[0])*(gz-C[2]))/d;
+        var ga = 1 - al - be;
+        if (al < -0.02 || be < -0.02 || ga < -0.02) continue;
+        addSample(gx, gz, al*A[1] + be*B[1] + ga*C[1]);
+      }
+    }
+  }
+  // number the nodes
+  var nodeKey = [], nodeY = [];
+  cells.forEach(function (arr, key) { for (var m = 0; m < arr.length; m++) { nodeKey.push(key); nodeY.push(arr[m]); } });
+  var n = nodeKey.length;
+  if (n < 50) return { ok: false, why: "too few road nodes" };
+  var cellNodes = new Map();
+  for (var i2 = 0; i2 < n; i2++) { var l = cellNodes.get(nodeKey[i2]); if (l) l.push(i2); else cellNodes.set(nodeKey[i2], [i2]); }
+  function nodesAt(cx, cz) { if (cz < 0 || cz >= H || cx < 0 || cx >= W) return []; return cellNodes.get(cx*H + cz) || []; }
+  function nx_(i) { return minx + (Math.floor(nodeKey[i]/H) + 0.5)*CELL; }
+  function nz_(i) { return minz + (nodeKey[i] % H + 0.5)*CELL; }
+
+  // ---- 3. block nodes that have walls or curbs rising just above them ----
+  var blocked = new Uint8Array(n);
+  for (var s2 = 0; s2 < sides.length; s2++) {
+    var A2 = sides[s2][0], B2 = sides[s2][1], C2 = sides[s2][2];
+    var lab = Math.max(Math.hypot(B2[0]-A2[0],B2[1]-A2[1],B2[2]-A2[2]), Math.hypot(C2[0]-A2[0],C2[1]-A2[1],C2[2]-A2[2]), Math.hypot(C2[0]-B2[0],C2[1]-B2[1],C2[2]-B2[2]));
+    var mm = Math.max(1, Math.ceil(lab/0.5));
+    for (var a1 = 0; a1 <= mm; a1++) for (var b1 = 0; b1 <= mm - a1; b1++) {
+      var uu = a1/mm, vv = b1/mm;
+      var px = A2[0] + (B2[0]-A2[0])*uu + (C2[0]-A2[0])*vv;
+      var py = A2[1] + (B2[1]-A2[1])*uu + (C2[1]-A2[1])*vv;
+      var pz = A2[2] + (B2[2]-A2[2])*uu + (C2[2]-A2[2])*vv;
+      var lst = nodesAt(Math.floor((px-minx)/CELL), Math.floor((pz-minz)/CELL));
+      for (var li = 0; li < lst.length; li++) { var nd = lst[li]; if (py >= nodeY[nd]+0.35 && py <= nodeY[nd]+2.0) blocked[nd] = 1; }
+    }
+  }
+
+  // ---- 4. neighbours (8 directions, slope limited) ----
+  var nbr = new Int32Array(n*8).fill(-1), ncount = new Uint8Array(n);
+  var DX = [1,-1,0,0,1,1,-1,-1], DZ = [0,0,1,-1,1,-1,1,-1];
+  for (var i3 = 0; i3 < n; i3++) {
+    if (blocked[i3]) continue;
+    var cx3 = Math.floor(nodeKey[i3]/H), cz3 = nodeKey[i3] % H;
+    for (var dd = 0; dd < 8; dd++) {
+      var cand = nodesAt(cx3+DX[dd], cz3+DZ[dd]);
+      var best = -1, bd = 9, dist = Math.hypot(DX[dd], DZ[dd])*CELL;
+      for (var ci = 0; ci < cand.length; ci++) {
+        var j = cand[ci]; if (blocked[j]) continue;
+        var dy = Math.abs(nodeY[j]-nodeY[i3]);
+        if (dy <= 0.85*dist && dy < bd) { bd = dy; best = j; }
+      }
+      if (best >= 0) { nbr[i3*8 + ncount[i3]] = best; ncount[i3]++; }
+    }
+  }
+
+  // ---- tiny binary heap ----
+  function Heap() { this.k = []; this.v = []; }
+  Heap.prototype.push = function (key, val) {
+    var k = this.k, v = this.v, i = k.length; k.push(key); v.push(val);
+    while (i > 0) { var pr = (i-1) >> 1; if (k[pr] <= key) break; k[i] = k[pr]; v[i] = v[pr]; i = pr; }
+    k[i] = key; v[i] = val;
+  };
+  Heap.prototype.pop = function () {
+    var k = this.k, v = this.v, topK = k[0], topV = v[0], lastK = k.pop(), lastV = v.pop(), len = k.length;
+    if (len > 0) {
+      var i = 0;
+      for (;;) { var c = 2*i+1; if (c >= len) break; if (c+1 < len && k[c+1] < k[c]) c++; if (k[c] >= lastK) break; k[i] = k[c]; v[i] = v[c]; i = c; }
+      k[i] = lastK; v[i] = lastV;
+    }
+    return [topK, topV];
+  };
+  Heap.prototype.size = function () { return this.k.length; };
+
+  // ---- 5. clearance = distance to the nearest road edge ----
+  var clr = new Float32Array(n).fill(1e9);
+  var hp = new Heap();
+  for (var i4 = 0; i4 < n; i4++) if (!blocked[i4] && ncount[i4] < 8) { clr[i4] = 0.5; hp.push(0.5, i4); }
+  while (hp.size()) {
+    var tp = hp.pop(), dcur = tp[0], ic = tp[1];
+    if (dcur > clr[ic]) continue;
+    for (var q2 = 0; q2 < ncount[ic]; q2++) {
+      var jn = nbr[ic*8+q2], nd2 = dcur + Math.hypot(nx_(jn)-nx_(ic), nz_(jn)-nz_(ic));
+      if (nd2 < clr[jn]) { clr[jn] = nd2; hp.push(nd2, jn); }
+    }
+  }
+
+  function nearestNode(x, z, y) {
+    var cx = Math.floor((x-minx)/CELL), cz = Math.floor((z-minz)/CELL), best = -1, bd = 1e18;
+    for (var r = 0; r <= 6; r++) {
+      for (var ddx = -r; ddx <= r; ddx++) for (var ddz = -r; ddz <= r; ddz++) {
+        if (Math.max(Math.abs(ddx), Math.abs(ddz)) !== r) continue;
+        var lst2 = nodesAt(cx+ddx, cz+ddz);
+        for (var u = 0; u < lst2.length; u++) {
+          var j = lst2[u]; if (blocked[j] || !ncount[j]) continue;
+          var ex = nx_(j)-x, ez = nz_(j)-z, ey = (nodeY[j]-y)*3, dsq = ex*ex+ez*ez+ey*ey;
+          if (dsq < bd) { bd = dsq; best = j; }
+        }
+      }
+      if (best >= 0 && r >= 1) break;
+    }
+    return best;
+  }
+
+  // ---- 6. jumps: where the road ends, fly along the heading and land on the first surface below ----
+  function surfaceAhead(x, y, z) {
+    var lst = nodesAt(Math.floor((x-minx)/CELL), Math.floor((z-minz)/CELL));
+    for (var u = 0; u < lst.length; u++) if (!blocked[lst[u]] && Math.abs(nodeY[lst[u]]-y) <= 1.5) return true;
+    return false;
+  }
+  function jumpEdges(i, hx, hz, slope) {
+    var x0 = nx_(i), y0 = nodeY[i], z0 = nz_(i);
+    if (surfaceAhead(x0+hx*2.5, y0+slope*2.5, z0+hz*2.5)) return [];
+    var out = new Map(), angs = [-9,-6,-3,0,3,6,9];
+    for (var ai = 0; ai < angs.length; ai++) {
+      var ar = angs[ai]*Math.PI/180, c = Math.cos(ar), s = Math.sin(ar);
+      var dx = hx*c - hz*s, dz = hx*s + hz*c;
+      for (var d = 3; d <= 150; d += 1) {
+        var ty = y0 + slope*d - GRAV*d*d/(2*VH*VH), x = x0+dx*d, z = z0+dz*d, hit = -1;
+        var lst = nodesAt(Math.floor((x-minx)/CELL), Math.floor((z-minz)/CELL));
+        for (var u = 0; u < lst.length; u++) {
+          var j = lst[u]; if (blocked[j] || !ncount[j]) continue;
+          var df = ty - nodeY[j];
+          if (df >= -1.2 && df <= 0.6) { hit = j; break; }
+        }
+        if (hit >= 0) { if (clr[hit] >= 3.0 && (!out.has(hit) || out.get(hit) > d)) out.set(hit, d); break; }
+      }
+    }
+    var res = []; out.forEach(function (d, j) { res.push([j, d]); });
+    return res;
+  }
+
+  // ---- 7. shortest path with a penalty near road edges ----
+  var dist = new Float64Array(n), prev = new Int32Array(n), hxA = new Float32Array(n), hzA = new Float32Array(n), slA = new Float32Array(n);
+  function search(src, dst) {
+    dist.fill(1e18); prev.fill(-1);
+    dist[src] = 0; hxA[src] = 1; hzA[src] = 0; slA[src] = 0;
+    var pq = new Heap(); pq.push(0, src);
+    while (pq.size()) {
+      var tp = pq.pop(), dd = tp[0], i = tp[1];
+      if (dd > dist[i]) continue;
+      if (i === dst) break;
+      var x1 = nx_(i), y1 = nodeY[i], z1 = nz_(i);
+      for (var q = 0; q < ncount[i]; q++) {
+        var j = nbr[i*8+q], x2 = nx_(j), y2 = nodeY[j], z2 = nz_(j);
+        var hl = Math.hypot(x2-x1, z2-z1), Ld = Math.sqrt(hl*hl + (y2-y1)*(y2-y1)), cj = clr[j];
+        var pen = 1 + 8*Math.pow(Math.max(0, (4-cj)/4), 2);
+        if (cj < 1.5) pen += 40;
+        var nd = dd + Ld*pen;
+        if (nd < dist[j]) {
+          dist[j] = nd; prev[j] = i;
+          var ux = (x2-x1)/hl, uz = (z2-z1)/hl, mx = hxA[i]*0.8 + ux*0.2, mz = hzA[i]*0.8 + uz*0.2, ml = Math.hypot(mx, mz) || 1;
+          hxA[j] = mx/ml; hzA[j] = mz/ml; slA[j] = slA[i]*0.8 + 0.2*(y2-y1)/hl;
+          pq.push(nd, j);
+        }
+      }
+      if (ncount[i] < 8) {
+        var je = jumpEdges(i, hxA[i], hzA[i], slA[i]);
+        for (var q3 = 0; q3 < je.length; q3++) {
+          var jj = je[q3][0], dj = je[q3][1], nd3 = dd + dj*2 + 80;
+          if (nd3 < dist[jj]) {
+            dist[jj] = nd3; prev[jj] = i;
+            var jx = nx_(jj)-x1, jz = nz_(jj)-z1, jl = Math.hypot(jx, jz) || 1;
+            hxA[jj] = jx/jl; hzA[jj] = jz/jl; slA[jj] = -0.3;
+            pq.push(nd3, jj);
+          }
+        }
+      }
+    }
+    if (dist[dst] >= 1e17) return null;
+    var path = [dst];
+    while (path[path.length-1] !== src) path.push(prev[path[path.length-1]]);
+    path.reverse();
+    return path;
+  }
+
+  // ---- 8. way points: start, checkpoints in order, finish ----
+  var wps = [];
+  var st = dec.start.p; wps.push({ name: "start", x: st[0], y: st[1], z: st[2] });
+  var cps = [];
+  for (var pi2 = 0; pi2 < dec.parts.length; pi2++) {
+    var pp = dec.parts[pi2], ee = dec.lib[pp[3]];
+    if (pp[6] >= 0 && ee && ee.detector) cps.push(pp);
+  }
+  cps.sort(function (a, b) { return a[6] - b[6]; });
+  function centreOf(pp, ee) {
+    var cc = ee.detector.center, r = qrot([pp[8], pp[9], pp[10], pp[11]], cc[0], cc[1], cc[2]);
+    return { x: r[0] + pp[0]*5, y: r[1] + pp[1]*5, z: r[2] + pp[2]*5 };
+  }
+  var seenOrder = {};
+  for (var ci2 = 0; ci2 < cps.length; ci2++) {
+    if (seenOrder[cps[ci2][6]]) continue; seenOrder[cps[ci2][6]] = true;
+    var cc2 = centreOf(cps[ci2], dec.lib[cps[ci2][3]]);
+    wps.push({ name: "checkpoint " + (cps[ci2][6]+1), x: cc2.x, y: cc2.y, z: cc2.z });
+  }
+  var fin = null;
+  for (var pi3 = 0; pi3 < dec.parts.length; pi3++) {
+    var pf = dec.parts[pi3], ef = dec.lib[pf[3]];
+    if (ef && ef.detector && ef.detector.type === 1) { fin = centreOf(pf, ef); break; }
+  }
+  if (!fin) return { ok: false, why: "no finish line found" };
+  wps.push({ name: "finish", x: fin.x, y: fin.y, z: fin.z });
+
+  var wn = [];
+  for (var wi = 0; wi < wps.length; wi++) {
+    var nn = nearestNode(wps[wi].x, wps[wi].z, wps[wi].y - 2.0);
+    if (nn < 0) return { ok: false, why: "no road near the " + wps[wi].name };
+    wn.push(nn);
+  }
+  var path = [];
+  for (var wk = 0; wk < wn.length - 1; wk++) {
+    var seg = search(wn[wk], wn[wk+1]);
+    if (!seg) return { ok: false, why: "no way from the " + wps[wk].name + " to the " + wps[wk+1].name };
+    for (var sk = (path.length ? 1 : 0); sk < seg.length; sk++) path.push(seg[sk]);
+  }
+
+  // ---- 9. resample, smooth inside the road, mark jumps ----
+  var pts = path.map(function (i) { return [nx_(i), nodeY[i], nz_(i)]; });
+  var jumpEdge = new Array(pts.length).fill(false);
+  var jumps = 0;
+  for (var k2 = 1; k2 < pts.length; k2++) if (Math.hypot(pts[k2][0]-pts[k2-1][0], pts[k2][1]-pts[k2-1][1], pts[k2][2]-pts[k2-1][2]) > 4.0) { jumpEdge[k2] = true; jumps++; }
+  var segLen = [0];
+  for (var k3 = 1; k3 < pts.length; k3++) segLen.push(segLen[k3-1] + Math.hypot(pts[k3][0]-pts[k3-1][0], pts[k3][2]-pts[k3-1][2]));
+  var total = segLen[segLen.length-1], m2 = Math.max(8, Math.round(total/SPACING)) + 1;
+  var out = [], isj = [], kk = 1;
+  for (var mi = 0; mi < m2; mi++) {
+    var sdist = total*mi/(m2-1);
+    while (kk < pts.length-1 && segLen[kk] < sdist) kk++;
+    var pa = pts[kk-1], pb = pts[kk], Ls = segLen[kk]-segLen[kk-1];
+    var tt = Ls < 1e-9 ? 0 : Math.min(1, Math.max(0, (sdist-segLen[kk-1])/Ls));
+    out.push([pa[0]+(pb[0]-pa[0])*tt, pa[1]+(pb[1]-pa[1])*tt, pa[2]+(pb[2]-pa[2])*tt]);
+    isj.push(jumpEdge[kk] && tt > 0 && tt < 1);
+  }
+  var pinned = [];
+  for (var mp = 0; mp < m2; mp++) pinned.push(isj[mp] || (mp > 0 && isj[mp-1]) || (mp < m2-1 && isj[mp+1]));
+  pinned[0] = true; pinned[m2-1] = true;
+  function layerNear(x, z, y, tol) {
+    var lst = nodesAt(Math.floor((x-minx)/CELL), Math.floor((z-minz)/CELL)), best = -1, bd = 1e9;
+    for (var u = 0; u < lst.length; u++) {
+      var j = lst[u]; if (blocked[j]) continue;
+      var df = Math.abs(nodeY[j]-y);
+      if (df < bd && df <= tol) { bd = df; best = j; }
+    }
+    return best;
+  }
+  for (var it = 0; it < 80; it++) {
+    for (var mq = 1; mq < m2-1; mq++) {
+      if (pinned[mq]) continue;
+      var P = out[mq];
+      var nxp = P[0] + 0.45*((out[mq-1][0]+out[mq+1][0])/2 - P[0]);
+      var nzp = P[2] + 0.45*((out[mq-1][2]+out[mq+1][2])/2 - P[2]);
+      var jl = layerNear(nxp, nzp, P[1], 1.6);
+      if (jl < 0 || clr[jl] < MINCLR) continue;
+      var okk = true, nb = [out[mq-1], out[mq+1]];
+      for (var bi = 0; bi < 2; bi++) {
+        var jm = layerNear((nxp+nb[bi][0])/2, (nzp+nb[bi][2])/2, (P[1]+nb[bi][1])/2, 2.2);
+        if (jm < 0 || clr[jm] < MINCLR*0.8) { okk = false; break; }
+      }
+      if (!okk) continue;
+      P[0] = nxp; P[2] = nzp; P[1] = nodeY[jl];
+    }
+  }
+  // height inside a jump: the arc a car follows, bent so it ends on the landing spot
+  var mj = 0;
+  while (mj < m2) {
+    if (isj[mj] || (mj > 0 && isj[mj-1] && false)) {
+      var ja = mj; while (ja > 0 && isj[ja-1]) ja--;
+      var jb = mj; while (jb < m2-1 && isj[jb]) jb++;
+      var pA = out[Math.max(0, ja-1)], pB = out[Math.min(m2-1, jb)];
+      var Dtot = Math.hypot(pB[0]-pA[0], pB[2]-pA[2]) || 1;
+      var sl0 = ja >= 2 ? (out[ja-1][1]-out[ja-2][1])/Math.max(1e-6, Math.hypot(out[ja-1][0]-out[ja-2][0], out[ja-1][2]-out[ja-2][2])) : 0;
+      var endBal = pA[1] + sl0*Dtot - GRAV*Dtot*Dtot/(2*VH*VH);
+      for (var jj2 = ja; jj2 < jb; jj2++) {
+        var dd2 = Math.hypot(out[jj2][0]-pA[0], out[jj2][2]-pA[2]);
+        var bal = pA[1] + sl0*dd2 - GRAV*dd2*dd2/(2*VH*VH);
+        out[jj2][1] = bal + (pB[1]-endBal)*(dd2/Dtot);
+      }
+      mj = jb;
+    }
+    mj++;
+  }
+  var route = [];
+  for (var ri = 0; ri < m2; ri++) route.push([Math.round(out[ri][0]*100)/100, Math.round(out[ri][1]*100)/100, Math.round(out[ri][2]*100)/100, ri === 0 ? 5 : VMAX]);
+  return { ok: true, route: route, jumpPoints: isj.filter(Boolean).length, jumps: jumps, nodes: n, ms: Date.now()-t0, lengthM: Math.round(total), waypoints: wps };
+}
+
 const WORKER_HELPERS = `
 (() => {
   if (globalThis.__ptTutorialBot) return;
-  const ROUTE = ${JSON.stringify(ROUTE)};
-  const N = ROUTE.length;
+  const ROUTE_REC = ${JSON.stringify(ROUTE)};
+  const ROUTE_SOURCE = ${JSON.stringify(ROUTE_SOURCE)};
+  let ROUTE = ROUTE_REC;
+  let N = ROUTE.length;
+  let TRACK_ID = null;
   const SPEED_FACTOR = ${SPEED_FACTOR};
   const STEER_GAIN = ${STEER_GAIN};
   const LAT_ACCEL = ${LAT_ACCEL};
   const LINE_PULL = ${LINE_PULL};
   const LOW_SPEED_BOOST = ${LOW_SPEED_BOOST};
-  const SLOW_ZONES = ${JSON.stringify(SLOW_ZONES)};
+  const SLOW_ZONES_REC = ${JSON.stringify(SLOW_ZONES)};
+  let SLOW_ZONES = SLOW_ZONES_REC.slice();
   const LOOK_BASE = ${LOOK_BASE};
   const LEARN = ${LEARN};
   const AIRBRAKE = ${AIRBRAKE};
@@ -198,6 +562,10 @@ const WORKER_HELPERS = `
     airSince: Object.create(null),
     airV0: Object.create(null),
     lastAirborne: Object.create(null),
+    keepSpeed: Object.create(null),
+    keepUntil: Object.create(null),
+    lastLand: Object.create(null),
+    lastBrakeLog: Object.create(null),
     landSteerUntil: Object.create(null),
     lastPitch: Object.create(null),
     airMatched: Object.create(null),
@@ -227,7 +595,7 @@ const WORKER_HELPERS = `
       if(d<bestD) { bestD=d; best=i; }
     }
 
-    if(!forceGlobal && bestD>30*30) {
+    if(!forceGlobal && bestD>45*45) {
       for(let i=0;i<N;i++) {
         const d=dist2(p,ROUTE[i]);
         if(d<bestD) { bestD=d; best=i; }
@@ -279,7 +647,10 @@ const WORKER_HELPERS = `
     return best===Infinity ? 0 : best;
   }
 
-  const CAP=[];
+  let CAP=[];
+  let SPD=[];
+  function computeDerived() {
+  CAP=[];
   for(let k=0;k<N;k++) {
     let kmax=0;
     for(let m=Math.max(1,k-2);m<=Math.min(N-2,k+2);m++) {
@@ -296,13 +667,15 @@ const WORKER_HELPERS = `
   // The recorded lap lost speed on every landing. A smoother landing keeps that speed, and the bot
   // used to brake to match the slower recorded number. So after each sudden drop we keep the
   // speed from just before it for a few points (corners are still limited by CAP below).
-  const SPD=ROUTE.map(p=>p[3]);
+  SPD=ROUTE.map(p=>p[3]);
   for(let k=1;k<N;k++) {
     if(ROUTE[k-1][3]-ROUTE[k][3]>12) {
       const keep=ROUTE[k-1][3];
       for(let m=k;m<Math.min(N,k+10);m++) SPD[m]=Math.max(SPD[m],keep);
     }
   }
+  }
+  computeDerived();
 
   function lateral(p,i) {
     const k=Math.max(0,Math.min(N-2,i));
@@ -317,16 +690,18 @@ const WORKER_HELPERS = `
 
   // ================= SELF-LEARNING =================
   const ch = (typeof BroadcastChannel !== "undefined") ? new BroadcastChannel("ptbot") : null;
-  const L = bot.learn = {
-    best:{cp:[],seg:[],dur:[],vexit:[],gt:[],gv:[],offs:new Array(N).fill(0),spd:new Array(N).fill(0)},
-    cur:{seg:[],offs:new Array(N).fill(0),spd:new Array(N).fill(0)},
-    run:null,runNo:0,pending:false,pendingFrame:0
-  };
+  const L = bot.learn = {best:null,cur:null,run:null,runNo:0,pending:false,pendingFrame:0};
+  function freshLearner() {
+    L.best={cp:[],seg:[],dur:[],vexit:[],gt:[],gv:[],offs:new Array(N).fill(0),spd:new Array(N).fill(0)};
+    L.cur={seg:[],offs:new Array(N).fill(0),spd:new Array(N).fill(0)};
+    L.run=null; L.runNo=0; L.pending=false; L.pendingFrame=0;
+  }
+  freshLearner();
   const DEF = {sp:1, off:0, br:6, ab:0};
   function clampv(v,a,b) { return Math.max(a,Math.min(b,v)); }
   function rnd(a) { return (Math.random()*2-1)*a; }
   function post(m) { if(ch) { try { ch.postMessage(m); } catch(_) {} } }
-  function saveBest() { post({type:"save", data:{n:N, best:L.best}}); }
+  function saveBest() { post({type:"save", track:TRACK_ID, data:{n:N, best:L.best}}); }
 
   function segOf(i) {
     const cp=L.best.cp;
@@ -541,7 +916,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
   if(ch) {
     ch.onmessage=(ev) => {
       const m=ev.data || {};
-      if(m.type==="load" && m.data && m.data.n===N && m.data.best &&
+      if(m.type==="load" && (m.track||null)===(TRACK_ID||null) && m.data && m.data.n===N && m.data.best &&
          Array.isArray(m.data.best.gt) && Array.isArray(m.data.best.spd) &&
          Array.isArray(m.data.best.offs) && m.data.best.offs.length===N &&
          m.data.best.spd.length===N && L.best.cp.length===0 && L.runNo<=1) {
@@ -551,7 +926,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
         startRun();
       }
     };
-    post({type:"hello"});
+    post({type:"hello",track:TRACK_ID});
   }
 
   if(LEARN) startRun();
@@ -633,6 +1008,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
 
   function choose(state,id) {
     if(!state) return {up:true,right:false,down:false,left:false,reset:false};
+    if(bot.noRoute) return {up:true,right:false,down:false,left:false,reset:false};
 
     const lf=bot.lastFrames[id];
     if(lf===undefined || state.frames<lf) {
@@ -646,6 +1022,9 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       bot.finLogged[id]=false;
       bot.lastCp[id]=undefined;
       bot.lastAirborne[id]=false;
+      bot.keepSpeed[id]=0;
+      bot.keepUntil[id]=0;
+      bot.lastLand[id]=-100000;
       bot.landSteerUntil[id]=0;
       bot.airSince[id]=undefined;
       bot.airV0[id]=undefined;
@@ -723,7 +1102,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     const angle=Math.atan2(cross,dot);
     const abs=Math.abs(angle);
 
-    const tSpeed=targetSpeed(i);
+    let tSpeed=targetSpeed(i);
+    if(state.frames<(bot.keepUntil[id]||0) && bot.keepSpeed[id]>tSpeed) tSpeed=bot.keepSpeed[id];
     let up=true,down=false;
     if(speed>tSpeed+8 && speed>40) { up=false;down=true; }
     else if(speed>tSpeed) up=false;
@@ -734,7 +1114,14 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     // Detect landing, then briefly soften heading correction to reduce sharp swerves.
     const airborneNow=state.wheels===0;
     const wasAirborne=bot.lastAirborne[id]===true;
-    if(wasAirborne && !airborneNow) bot.landSteerUntil[id]=state.frames+18;
+    if(wasAirborne && !airborneNow) {
+      bot.landSteerUntil[id]=state.frames+18;
+      if(bot.airSince[id]!==undefined && state.frames-bot.airSince[id]>60) {
+        bot.lastLand[id]=state.frames;
+        bot.keepSpeed[id]=bot.airV0[id]||0;
+        bot.keepUntil[id]=state.frames+450;
+      }
+    }
     bot.lastAirborne[id]=airborneNow;
 
     const landing=state.frames<(bot.landSteerUntil[id]||0);
@@ -785,7 +1172,10 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
 
     if(vmax-speed>45 && state.frames-(bot.lastCrash[id]??-100000)>2000) {
       bot.lastCrash[id]=state.frames;
-      if(vmax-speed>80) failRun("crash (big speed drop)",state);
+      if(vmax-speed>80) {
+        if(state.frames-(bot.lastLand[id]??-100000)<400) console.log("PTBOT_CRASH ignored: the speed drop was right after a landing");
+        else failRun("crash (big speed drop)",state);
+      }
       console.log("PTBOT_CRASH","frame="+state.frames,"idx="+i+"/"+(N-1),
         "pos="+state.position.x.toFixed(0)+","+state.position.z.toFixed(0),
         "speed="+Math.round(vmax)+"->"+Math.round(speed),
@@ -859,6 +1249,13 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       bot.dbg.air={t:airFor,pitch:+pitch.toFixed(2),want:+want.toFixed(2),level:!!bot.airMatched[id]};
     }
 
+    if(down && !airborne && state.frames-(bot.lastLand[id]??-100000)<700 &&
+       state.frames-(bot.lastBrakeLog[id]??-100000)>100) {
+      bot.lastBrakeLog[id]=state.frames;
+      console.log("PTBOT_BRAKE","after landing: frame="+state.frames,"idx="+i+"/"+(N-1),
+        "speed="+Math.round(speed),"want="+Math.round(tSpeed),"ang="+angle.toFixed(2),"wheels="+state.wheels);
+    }
+
     return {up,right,down,left,reset};
   }
 
@@ -896,7 +1293,23 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     }
   }
 
-  // ---- TRACK CAPTURE (research): reads the track the game gives the physics worker ----
+  ${generateRoute.toString()}
+
+  // ---- ROUTE SWITCHING ----
+  const PER_CAR=["idx","acc","stuck","lastPos","lastFrames","hist","lastCrash","lastOff","lastCp","airSince","airV0",
+    "lastAirborne","keepSpeed","keepUntil","lastLand","lastBrakeLog","landSteerUntil","lastPitch","airMatched","finLogged"];
+  function applyRoute(route,trackId,kind) {
+    ROUTE=route; N=route.length; TRACK_ID=trackId;
+    SLOW_ZONES = kind==="recorded" ? SLOW_ZONES_REC.slice() : [];
+    computeDerived();
+    for(const k of PER_CAR) bot[k]=Object.create(null);
+    bot.route=ROUTE; bot.noRoute=false; bot.routeKind=kind;
+    if(LEARN) { freshLearner(); post({type:"hello",track:TRACK_ID}); startRun(); }
+  }
+  function hashStr(t) { let h=5381; for(let i=0;i<t.length;i++) h=((h*33)^t.charCodeAt(i))>>>0; return h.toString(16); }
+  let lastTrackData=null;
+
+  // ---- TRACK CAPTURE: reads the track the game gives the physics worker ----
   const TRACK_LIB = Object.create(null);
   function r3(v) { return Math.round(v*1000)/1000; }
   function captureTrack(m) {
@@ -927,6 +1340,31 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       try { fins=track.getFinishes(); } catch(_) {}
       const data={partSize:Lo.partSize,parts:parts,lib:lib,start:start,checkpoints:cps,finishes:fins,
         mountainOffset:m.mountainOffset||null};
+      // choose the driving line for this track
+      if(m.trackData!==lastTrackData) {
+        lastTrackData=m.trackData;
+        const tid=hashStr(m.trackData);
+        const startP=start ? start.p : null;
+        const recMatches=!!startP && Math.hypot(ROUTE_REC[0][0]-startP[0],ROUTE_REC[0][2]-startP[2])<15;
+        let gen=null;
+        if(ROUTE_SOURCE==="recorded" || (ROUTE_SOURCE==="auto" && recMatches)) {
+          console.log("PTBOT_ROUTE using your recorded lap for this track");
+          applyRoute(ROUTE_REC,null,"recorded");
+        } else {
+          try { gen=generateRoute({parts:parts,lib:TRACK_LIB,start:start}); } catch(err) { gen={ok:false,why:"error: "+String(err)}; }
+          if(gen && gen.ok) {
+            console.log("PTBOT_ROUTE built a line from the track: "+gen.route.length+" points, "+gen.lengthM+" m, "+gen.jumps+" jump(s), "+gen.ms+" ms");
+            applyRoute(gen.route,tid,"generated");
+            try { if(ch) ch.postMessage({type:"route",info:{track:tid,points:gen.route.length,lengthM:gen.lengthM,jumps:gen.jumps,ms:gen.ms,waypoints:gen.waypoints},route:gen.route}); } catch(_) {}
+          } else if(ROUTE_SOURCE==="generated" && recMatches) {
+            console.log("PTBOT_ROUTE could not build a line ("+(gen?gen.why:"?")+"), using your recorded lap instead");
+            applyRoute(ROUTE_REC,null,"recorded");
+          } else {
+            console.log("PTBOT_ROUTE could not build a line: "+(gen?gen.why:"?")+". The bot will only drive forward on this track.");
+            bot.noRoute=true;
+          }
+        }
+      }
       let clean=null;
       try { clean=JSON.parse(JSON.stringify(data)); } catch(err) { console.log("PTBOT_TRACK could not copy: "+String(err)); }
       if(clean) {
@@ -1084,7 +1522,8 @@ function setupMainThread() {
   if(RECON) { try { installRecon(); } catch(err) { console.log("PTBOT_RECON failed",err); } }
   if(typeof BroadcastChannel==="undefined") return;
   const ch=new BroadcastChannel("ptbot");
-  const STORE="ptbot_learn_v5";
+  const STORE_BASE="ptbot_learn_v5";
+  const storeKey=(t)=>t?STORE_BASE+"_"+t:STORE_BASE;
 
   window.ptTrackDump=()=>{
     if(!window.__ptTrack && !(window.__ptRaw && window.__ptRaw.trackData)) {
@@ -1093,6 +1532,12 @@ function setupMainThread() {
     }
     ptDownload("ptbot_track.json",JSON.stringify({decoded:window.__ptTrack||null,raw:window.__ptRaw||null}));
     console.log("saved ptbot_track.json (decoded track: "+(window.__ptTrack?"yes":"no")+", raw track code: "+(window.__ptRaw&&window.__ptRaw.trackData?"yes":"no")+")");
+  };
+
+  window.ptRouteDump=()=>{
+    if(!window.__ptRoute) { console.log("no generated line yet (it is only built when your recorded lap does not belong to the track, or ROUTE_SOURCE is generated)"); return; }
+    ptDownload("ptbot_route.json",JSON.stringify(window.__ptRoute));
+    console.log("saved ptbot_route.json");
   };
 
   function fire(type,k) {
@@ -1111,14 +1556,17 @@ function setupMainThread() {
     const m=ev.data||{};
     if(m.type==="hello") {
       try {
-        const d=localStorage.getItem(STORE);
-        ch.postMessage({type:"load",data:d?JSON.parse(d):null});
+        const d=localStorage.getItem(storeKey(m.track));
+        ch.postMessage({type:"load",track:m.track||null,data:d?JSON.parse(d):null});
       } catch (_) {}
     } else if(m.type==="track") {
       window.__ptTrack=m.data;
       console.log("PTBOT_TRACK received on the page: "+m.data.parts.length+" parts, "+(m.data.checkpoints?m.data.checkpoints.length:0)+" checkpoints. Type ptTrackDump() to save it as a file.");
+    } else if(m.type==="route") {
+      window.__ptRoute=m;
+      console.log("PTBOT_ROUTE (page) line built: "+m.info.points+" points, "+m.info.lengthM+" m, "+m.info.jumps+" jump(s). Type ptRouteDump() to save it as a file.");
     } else if(m.type==="save") {
-      try { localStorage.setItem(STORE,JSON.stringify(m.data)); } catch (_) {}
+      try { localStorage.setItem(storeKey(m.track),JSON.stringify(m.data)); } catch (_) {}
     } else if(m.type==="restart" && AUTO_RESTART) {
       setTimeout(()=>{
         tap(RESTART_KEY,60);
@@ -1139,7 +1587,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.6.2";
+    this.modVersion="0.7.0";
     this.touchingPhysics=true;
   }
 
