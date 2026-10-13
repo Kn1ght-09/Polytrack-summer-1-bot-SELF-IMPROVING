@@ -3,7 +3,7 @@ import { PolyMod, MixinType } from "https://cdn.polymodloader.com/cb/PolyTrackMo
 
 // "drive" = the bot drives the recorded lap.
 // "record" = you drive manually and the mod records the lap.
-const MODE = "drive";
+const MODE = "record";
 
 // Where the driving line comes from:
 //   "auto"      = use your recorded lap if it belongs to the loaded track, otherwise build a line from the track itself
