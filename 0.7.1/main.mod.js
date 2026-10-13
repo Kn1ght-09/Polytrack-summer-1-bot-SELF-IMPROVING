@@ -163,7 +163,7 @@ const ROUTE = [
 function generateRoute(dec, opt) {
   opt = opt || {};
   var CELL = 1.0, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.3, VMAX = opt.vmax || 250;
-  var GRAV = 16.0, VH = 55.0;
+  var GRAV = 16.0, VH = 55.0, VHS = [12, 35, 55, 75];
   var t0 = Date.now();
 
   function qrot(q, x, y, z) {
@@ -240,6 +240,8 @@ function generateRoute(dec, opt) {
   var nodeKey = [], nodeY = [];
   cells.forEach(function (arr, key) { for (var m = 0; m < arr.length; m++) { nodeKey.push(key); nodeY.push(arr[m]); } });
   var n = nodeKey.length;
+  var minNodeY = 1e9;
+  for (var iy = 0; iy < n; iy++) if (nodeY[iy] < minNodeY) minNodeY = nodeY[iy];
   if (n < 50) return { ok: false, why: "too few road nodes" };
   var cellNodes = new Map();
   for (var i2 = 0; i2 < n; i2++) { var l = cellNodes.get(nodeKey[i2]); if (l) l.push(i2); else cellNodes.set(nodeKey[i2], [i2]); }
@@ -275,7 +277,7 @@ function generateRoute(dec, opt) {
       for (var ci = 0; ci < cand.length; ci++) {
         var j = cand[ci]; if (blocked[j]) continue;
         var dy = Math.abs(nodeY[j]-nodeY[i3]);
-        if (dy <= 0.85*dist && dy < bd) { bd = dy; best = j; }
+        if (dy <= 1.0*dist && dy < bd) { bd = dy; best = j; }
       }
       if (best >= 0) { nbr[i3*8 + ncount[i3]] = best; ncount[i3]++; }
     }
@@ -338,12 +340,14 @@ function generateRoute(dec, opt) {
   function jumpEdges(i, hx, hz, slope) {
     var x0 = nx_(i), y0 = nodeY[i], z0 = nz_(i);
     if (surfaceAhead(x0+hx*2.5, y0+slope*2.5, z0+hz*2.5)) return [];
-    var out = new Map(), angs = [-9,-6,-3,0,3,6,9];
-    for (var ai = 0; ai < angs.length; ai++) {
+    var out = new Map(), angs = [-12,-8,-4,0,4,8,12];
+    for (var vi = 0; vi < VHS.length; vi++) for (var ai = 0; ai < angs.length; ai++) {
+      var VH = VHS[vi];
       var ar = angs[ai]*Math.PI/180, c = Math.cos(ar), s = Math.sin(ar);
       var dx = hx*c - hz*s, dz = hx*s + hz*c;
       for (var d = 3; d <= 150; d += 1) {
         var ty = y0 + slope*d - GRAV*d*d/(2*VH*VH), x = x0+dx*d, z = z0+dz*d, hit = -1;
+        if (ty < minNodeY - 3) break;
         var lst = nodesAt(Math.floor((x-minx)/CELL), Math.floor((z-minz)/CELL));
         for (var u = 0; u < lst.length; u++) {
           var j = lst[u]; if (blocked[j] || !ncount[j]) continue;
@@ -359,14 +363,15 @@ function generateRoute(dec, opt) {
 
   // ---- 7. shortest path with a penalty near road edges ----
   var dist = new Float64Array(n), prev = new Int32Array(n), hxA = new Float32Array(n), hzA = new Float32Array(n), slA = new Float32Array(n);
-  function search(src, dst) {
+  function search(src, goal) {
+    var dst = -1;
     dist.fill(1e18); prev.fill(-1);
     dist[src] = 0; hxA[src] = 1; hzA[src] = 0; slA[src] = 0;
     var pq = new Heap(); pq.push(0, src);
     while (pq.size()) {
       var tp = pq.pop(), dd = tp[0], i = tp[1];
       if (dd > dist[i]) continue;
-      if (i === dst) break;
+      if (goal[i] && i !== src) { dst = i; break; }
       var x1 = nx_(i), y1 = nodeY[i], z1 = nz_(i);
       for (var q = 0; q < ncount[i]; q++) {
         var j = nbr[i*8+q], x2 = nx_(j), y2 = nodeY[j], z2 = nz_(j);
@@ -394,7 +399,7 @@ function generateRoute(dec, opt) {
         }
       }
     }
-    if (dist[dst] >= 1e17) return null;
+    if (dst < 0) return null;
     var path = [dst];
     while (path[path.length-1] !== src) path.push(prev[path[path.length-1]]);
     path.reverse();
@@ -418,28 +423,45 @@ function generateRoute(dec, opt) {
   for (var ci2 = 0; ci2 < cps.length; ci2++) {
     if (seenOrder[cps[ci2][6]]) continue; seenOrder[cps[ci2][6]] = true;
     var cc2 = centreOf(cps[ci2], dec.lib[cps[ci2][3]]);
-    wps.push({ name: "checkpoint " + (cps[ci2][6]+1), x: cc2.x, y: cc2.y, z: cc2.z });
+    wps.push({ name: "checkpoint " + (cps[ci2][6]+1), x: cc2.x, y: cc2.y, z: cc2.z, part: cps[ci2] });
   }
-  var fin = null;
+  var fin = null, finPart = null;
   for (var pi3 = 0; pi3 < dec.parts.length; pi3++) {
     var pf = dec.parts[pi3], ef = dec.lib[pf[3]];
-    if (ef && ef.detector && ef.detector.type === 1) { fin = centreOf(pf, ef); break; }
+    if (ef && ef.detector && ef.detector.type === 1) { fin = centreOf(pf, ef); finPart = pf; break; }
   }
   if (!fin) return { ok: false, why: "no finish line found" };
-  wps.push({ name: "finish", x: fin.x, y: fin.y, z: fin.z });
+  wps.push({ name: "finish", x: fin.x, y: fin.y, z: fin.z, part: finPart });
 
-  var wn = [];
-  for (var wi = 0; wi < wps.length; wi++) {
+  function qinv(q) { return [-q[0], -q[1], -q[2], q[3]]; }
+  function gateGoal(pp, ee, fallback) {
+    var det = ee.detector, cc = det.center, sz = det.size, qi = qinv([pp[8], pp[9], pp[10], pp[11]]);
+    var ox = pp[0]*5, oy = pp[1]*5, oz = pp[2]*5, flags = new Uint8Array(n), count = 0;
+    for (var i = 0; i < n; i++) {
+      if (blocked[i] || !ncount[i]) continue;
+      var l = qrot(qi, nx_(i)-ox, nodeY[i]-oy, nz_(i)-oz);
+      if (Math.abs(l[0]-cc[0]) <= sz[0]/2 + 1.0 && Math.abs(l[2]-cc[2]) <= sz[2]/2 + 1.0 && l[1] >= -0.8 && l[1] <= cc[1] + sz[1]/2 + 0.5) { flags[i] = 1; count++; }
+    }
+    if (!count && fallback >= 0) { flags[fallback] = 1; count = 1; }
+    return { flags: flags, count: count };
+  }
+  var gates = [];
+  var startNode = nearestNode(wps[0].x, wps[0].z, wps[0].y - 2.0);
+  if (startNode < 0) return { ok: false, why: "no road near the start" };
+  for (var wi = 1; wi < wps.length; wi++) {
+    var gp = wps[wi].part, ge = dec.lib[gp[3]];
     var nn = nearestNode(wps[wi].x, wps[wi].z, wps[wi].y - 2.0);
-    if (nn < 0) return { ok: false, why: "no road near the " + wps[wi].name };
-    wn.push(nn);
+    gates.push(gateGoal(gp, ge, nn));
+    if (!gates[gates.length-1].count) return { ok: false, why: "no road near the " + wps[wi].name };
   }
-  var path = [];
-  for (var wk = 0; wk < wn.length - 1; wk++) {
-    var seg = search(wn[wk], wn[wk+1]);
-    if (!seg) return { ok: false, why: "no way from the " + wps[wk].name + " to the " + wps[wk+1].name };
+  var path = [], src = startNode, reached = 0, partialWhy = null;
+  for (var wk = 0; wk < gates.length; wk++) {
+    var seg = search(src, gates[wk].flags);
+    if (!seg) { partialWhy = "no way from the " + wps[wk].name + " to the " + wps[wk+1].name; break; }
     for (var sk = (path.length ? 1 : 0); sk < seg.length; sk++) path.push(seg[sk]);
+    src = seg[seg.length-1]; reached = wk + 1;
   }
+  if (!reached) return { ok: false, why: partialWhy };
 
   // ---- 9. resample, smooth inside the road, mark jumps ----
   var pts = path.map(function (i) { return [nx_(i), nodeY[i], nz_(i)]; });
@@ -508,7 +530,7 @@ function generateRoute(dec, opt) {
   }
   var route = [];
   for (var ri = 0; ri < m2; ri++) route.push([Math.round(out[ri][0]*100)/100, Math.round(out[ri][1]*100)/100, Math.round(out[ri][2]*100)/100, ri === 0 ? 5 : VMAX]);
-  return { ok: true, route: route, jumpPoints: isj.filter(Boolean).length, jumps: jumps, nodes: n, ms: Date.now()-t0, lengthM: Math.round(total), waypoints: wps };
+  return { ok: true, partial: partialWhy, reachedGates: reached, route: route, jumpPoints: isj.filter(Boolean).length, jumps: jumps, nodes: n, ms: Date.now()-t0, lengthM: Math.round(total), waypoints: wps.map(function (w) { return { name: w.name, x: w.x, y: w.y, z: w.z }; }) };
 }
 
 const WORKER_HELPERS = `
@@ -1587,7 +1609,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.7.0";
+    this.modVersion="0.7.1";
     this.touchingPhysics=true;
   }
 
