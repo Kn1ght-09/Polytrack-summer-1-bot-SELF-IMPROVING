@@ -261,7 +261,12 @@ function generateRoute(dec, opt) {
       var py = A2[1] + (B2[1]-A2[1])*uu + (C2[1]-A2[1])*vv;
       var pz = A2[2] + (B2[2]-A2[2])*uu + (C2[2]-A2[2])*vv;
       var lst = nodesAt(Math.floor((px-minx)/CELL), Math.floor((pz-minz)/CELL));
-      for (var li = 0; li < lst.length; li++) { var nd = lst[li]; if (py >= nodeY[nd]+0.35 && py <= nodeY[nd]+2.0) blocked[nd] = 1; }
+      var CURB_BLOCK_MIN = 0.6;
+      var CURB_BLOCK_MAX = 1.8;
+      for (var li = 0; li < lst.length; li++) {
+        var nd = lst[li];
+        if (py >= nodeY[nd] + CURB_BLOCK_MIN && py <= nodeY[nd] + CURB_BLOCK_MAX) blocked[nd] = 1;
+      }
     }
   }
 
@@ -354,7 +359,13 @@ function generateRoute(dec, opt) {
           var df = ty - nodeY[j];
           if (df >= -1.2 && df <= 0.6) { hit = j; break; }
         }
-        if (hit >= 0) { if (clr[hit] >= 3.0 && (!out.has(hit) || out.get(hit) > d)) out.set(hit, d); break; }
+        if (hit >= 0) {
+          var MIN_CLR_LONG_JUMP = 3.0;
+          var MIN_CLR_SHORT_JUMP = 1.2;
+          var minClrNeeded = (d <= 8) ? MIN_CLR_SHORT_JUMP : MIN_CLR_LONG_JUMP;
+          if (clr[hit] >= minClrNeeded && (!out.has(hit) || out.get(hit) > d)) out.set(hit, d);
+          break;
+        }
       }
     }
     var res = []; out.forEach(function (d, j) { res.push([j, d]); });
@@ -545,7 +556,7 @@ function generateRoute(dec, opt) {
   }
   var route = [];
   for (var ri = 0; ri < m2; ri++) route.push([Math.round(out[ri][0]*100)/100, Math.round(out[ri][1]*100)/100, Math.round(out[ri][2]*100)/100, ri === 0 ? 5 : VMAX]);
-  return { ok: true, partial: partialWhy, reachedGates: reached, route: route, jumpPoints: isj.filter(Boolean).length, jumps: jumps, nodes: n, ms: Date.now()-t0, lengthM: Math.round(total), waypoints: wps.map(function (w) { return { name: w.name, x: w.x, y: w.y, z: w.z }; }) };
+  return { ok: true, partial: partialWhy, reachedGates: reached, route: route, jumpPoints: isj.filter(Boolean).length, jumps: jumps, nodes: n, ms: Date.now()-t0, lengthM: Math.round(total), waypoints:[...]
 }
 
 const WORKER_HELPERS = `
@@ -1219,7 +1230,13 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
         "offLine="+err.toFixed(1)+"m","want="+Math.round(tSpeed),"ang="+angle.toFixed(2));
     }
 
-    if(LEARN && err>MAX_LINE_SHIFT+8) failRun("far off the line ("+err.toFixed(0)+" m)",state);
+    if(LEARN) {
+      var OFFLINE_BASE = MAX_LINE_SHIFT + 8;
+      var OFFLINE_AIR = MAX_LINE_SHIFT + 20;
+      var OFFLINE_SPEED_FACTOR = speed > 140 ? 8 : 0;
+      var offlineThreshold = (state.wheels === 0) ? OFFLINE_AIR : (OFFLINE_BASE + OFFLINE_SPEED_FACTOR);
+      if (err > offlineThreshold) failRun("far off the line ("+err.toFixed(0)+" m)",state);
+    }
     if(err>5 && state.frames-(bot.lastOff[id]??-100000)>150) {
       bot.lastOff[id]=state.frames;
       console.log("PTBOT_OFF","frame="+state.frames,"idx="+i+"/"+(N-1),
