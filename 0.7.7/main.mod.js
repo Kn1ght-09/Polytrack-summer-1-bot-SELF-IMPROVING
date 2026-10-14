@@ -41,14 +41,14 @@ const RESTART_KEY = { key: "t", code: "KeyT", keyCode: 84 };
 
 // ---- DRIVING SETTINGS ----
 const SPEED_FACTOR = 1.0;
-const STEER_GAIN = 3.5;
-const LAT_ACCEL = 40;
+const STEER_GAIN = 2.6; // lower steering duty to reduce sudden over-corrections
+const LAT_ACCEL = 18; // conservative cornering limit: brake for bends sooner
 const SLOW_ZONES = [[5, 17, 95]];
-const LOW_SPEED_BOOST = 2;
-const LINE_PULL = 0.03;
-const LOOK_BASE = 6;
-const LOOK_SPEED = 0.09;
-const LOOK_MAX = 34;
+const LOW_SPEED_BOOST = 0.8; // avoid excessive steering amplification at low speed
+const LINE_PULL = 0.045; // stronger surface-relative correction to hold the route on loops/walls
+const LOOK_BASE = 9; // look farther ahead before reacting to bends
+const LOOK_SPEED = 0.12;
+const LOOK_MAX = 42;
 const DECODE_OFFSET = 4;
 const STEER_SIGN = -1;
 const FORWARD_SIGN = 1;
@@ -164,7 +164,7 @@ const ROUTE = [
 // dec = { parts:[[x,y,z,id,rot,axis,cpo,so,qx,qy,qz,qw],...], lib:{id:{v:[...],detector,startOffset}}, start:{p:[x,y,z]} }
 function generateRoute3D(dec, opt) {
   opt = opt || {};
-  var S = opt.step || 1.3, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.0, VMAX = opt.vmax || 250;
+  var S = opt.step || 1.3, SPACING = opt.spacing || 3.5, MINCLR = opt.minClr || 3.0, VMAX = opt.vmax || 250;
   var GRAV = 16.0, VHS = [12, 35, 55, 75], VH = 55.0;
   var NB = 16, RAD = S*1.7, T0 = Date.now();
 
@@ -1043,28 +1043,39 @@ const WORKER_HELPERS = `
   }
 
   function lookAhead(p,ld,i) {
-    let j=i;
-    if(j<N-1) {
-      const dx=ROUTE[j+1][0]-ROUTE[j][0];
-      const dy=flatSeg(j)?0:ROUTE[j+1][1]-ROUTE[j][1];
-      const dz=ROUTE[j+1][2]-ROUTE[j][2];
-      if((p.x-ROUTE[j][0])*dx+(p.y-ROUTE[j][1])*dy+(p.z-ROUTE[j][2])*dz>0) j++;
+    // First project the car onto a nearby route segment. Starting the look-ahead
+    // from the car's raw position made it walk back toward a waypoint behind the
+    // car when the car was offset, producing late U-turn-like corrections.
+    const lo=Math.max(0,i-2), hi=Math.min(N-2,i+3);
+    let seg=Math.max(0,Math.min(N-2,i)), bestT=0, bestD=Infinity;
+    let sx=ROUTE[seg][0], sy=ROUTE[seg][1], sz=ROUTE[seg][2];
+    for(let k=lo;k<=hi;k++) {
+      const a=ROUTE[k], b=ROUTE[k+1], flat=flatSeg(k);
+      const dx=b[0]-a[0], dy=flat?0:b[1]-a[1], dz=b[2]-a[2];
+      const px=p.x-a[0], py=flat?0:p.y-a[1], pz=p.z-a[2];
+      const l2=dx*dx+dy*dy+dz*dz;
+      const t=Math.max(0,Math.min(1,l2>1e-9?(px*dx+py*dy+pz*dz)/l2:0));
+      const x=a[0]+(b[0]-a[0])*t, y=a[1]+(b[1]-a[1])*t, z=a[2]+(b[2]-a[2])*t;
+      const ex=p.x-x, ey=p.y-y, ez=p.z-z;
+      const d=ex*ex+ey*ey+ez*ez;
+      // Tie-break toward the later segment so the target progresses forward.
+      if(d<bestD-1e-5 || (Math.abs(d-bestD)<=1e-5 && k>seg)) {
+        bestD=d; seg=k; bestT=t; sx=x; sy=y; sz=z;
+      }
     }
 
-    let ax=p.x, ay=p.y, az=p.z;
+    let ax=sx, ay=sy, az=sz;
     let remaining=ld;
-
-    for(let k=j;k<N;k++) {
+    // Consume the remainder of the projected segment, then continue forward.
+    for(let k=seg+1;k<N;k++) {
       const bx=ROUTE[k][0], by=ROUTE[k][1], bz=ROUTE[k][2];
       const len=flatSeg(k-1)?Math.hypot(bx-ax,bz-az):Math.hypot(bx-ax,by-ay,bz-az);
       if(len>=remaining) {
         const f=remaining/Math.max(len,1e-9);
         return {x:ax+(bx-ax)*f,y:ay+(by-ay)*f,z:az+(bz-az)*f,index:k};
       }
-      remaining-=len;
-      ax=bx; ay=by; az=bz;
+      remaining-=len; ax=bx; ay=by; az=bz;
     }
-
     const last=ROUTE[N-1];
     return {x:last[0],y:last[1],z:last[2],index:N-1};
   }
@@ -1095,8 +1106,15 @@ const WORKER_HELPERS = `
 
   let CAP=[];
   let SPD=[];
+  let ROUTE_DIST=[];
   function computeDerived() {
   CAP=[];
+  ROUTE_DIST=new Array(N).fill(0);
+  for(let k=1;k<N;k++) {
+    const a=ROUTE[k-1], b=ROUTE[k];
+    const dx=b[0]-a[0], dy=b[1]-a[1], dz=b[2]-a[2];
+    ROUTE_DIST[k]=ROUTE_DIST[k-1]+(flatSeg(k-1)?Math.hypot(dx,dz):Math.hypot(dx,dy,dz));
+  }
   for(let k=0;k<N;k++) {
     let kmax=0;
     for(let m=Math.max(1,k-2);m<=Math.min(N-2,k+2);m++) {
@@ -1162,7 +1180,7 @@ const WORKER_HELPERS = `
     L.run=null; L.runNo=0; L.pending=false; L.pendingFrame=0;
   }
   freshLearner();
-  const DEF = {sp:1, off:0, br:6, ab:0};
+  const DEF = {sp:1, off:0, br:4.5, ab:0}; // lower value starts braking earlier
   function clampv(v,a,b) { return Math.max(a,Math.min(b,v)); }
   function rnd(a) { return (Math.random()*2-1)*a; }
   function post(m) { if(ch) { try { ch.postMessage(m); } catch(_) {} } }
@@ -1409,9 +1427,31 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     return Math.atan2(ROUTE[k][1]-ROUTE[k-1][1],dh);
   }
 
+  // Estimate geometric curvature in full 3D. In a loop, the car must follow the
+  // changing tangent even when that change is not a sideways corner. A long
+  // look-ahead can point across the loop's chord and make the bot steer sharply
+  // toward the ground, so cap look-ahead distance on tight 3D bends.
+  function localPathCurvature(i) {
+    let maxCurv=0;
+    for(let k=Math.max(1,i-2);k<=Math.min(N-2,i+5);k++) {
+      const a=ROUTE[k-1], b=ROUTE[k], c=ROUTE[k+1];
+      const ax=b[0]-a[0], ay=b[1]-a[1], az=b[2]-a[2];
+      const bx=c[0]-b[0], by=c[1]-b[1], bz=c[2]-b[2];
+      const la=Math.hypot(ax,ay,az), lb=Math.hypot(bx,by,bz);
+      if(la<1e-4 || lb<1e-4) continue;
+      const dot=clampv((ax*bx+ay*by+az*bz)/(la*lb),-1,1);
+      const bend=Math.acos(dot);
+      maxCurv=Math.max(maxCurv,bend/Math.max(1e-4,(la+lb)*0.5));
+    }
+    return maxCurv;
+  }
+
   function targetSpeed(i) {
     let best=Infinity;
-    const hi=Math.min(N-1,i+25);
+    // Preview by physical distance, not a fixed waypoint count (the 3D route now
+    // has denser points). This sees sharp corners early enough to start braking.
+    let hi=i;
+    while(hi<N-1 && hi-i<150 && ROUTE_DIST[hi]-ROUTE_DIST[i]<320) hi++;
     const Pi=paramsAt(i);
 
     for(let j=i;j<=hi;j++) {
@@ -1546,6 +1586,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     }
 
     let ld=Math.max(LOOK_BASE,Math.min(LOOK_MAX,LOOK_BASE+speed*LOOK_SPEED));
+    const pathCurvature=localPathCurvature(i);
+    if(pathCurvature>0.025) ld=Math.min(ld,Math.max(8,Math.min(28,1.15/pathCurvature)));
     let target=lookAhead(state.position,ld,i);
     if(LEARN) {
       const toff=offAt(target.index);
@@ -2052,7 +2094,7 @@ function setupMainThread() {
   if(RECON) { try { installRecon(); } catch(err) { console.log("PTBOT_RECON failed",err); } }
   if(typeof BroadcastChannel==="undefined") return;
   const ch=new BroadcastChannel("ptbot");
-  const STORE_BASE="ptbot_learn_v5";
+  const STORE_BASE="ptbot_learn_v6";
   const storeKey=(t)=>t?STORE_BASE+"_"+t:STORE_BASE;
 
   window.ptTrackDump=()=>{
@@ -2147,7 +2189,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.7.6";
+    this.modVersion="0.7.7";
     this.touchingPhysics=true;
   }
 
