@@ -31,6 +31,7 @@ const SPEED_VALUE = 0.8;
 const MAX_LINE_SHIFT = 6;
 const MAX_SPEED_SHIFT = 0.2;
 const EXPLORE_RUNS = 60;
+const REC_KEY = "o"; // press once to start recording YOUR driving (bot steps aside), press again to stop and save
 const AUTO_RESTART = true;
 const AUTO_START = true;
 const AUTO_START_MS = 100;
@@ -556,7 +557,7 @@ function generateRoute(dec, opt) {
   }
   var route = [];
   for (var ri = 0; ri < m2; ri++) route.push([Math.round(out[ri][0]*100)/100, Math.round(out[ri][1]*100)/100, Math.round(out[ri][2]*100)/100, ri === 0 ? 5 : VMAX]);
-  return { ok: true, partial: partialWhy, reachedGates: reached, route: route, jumpPoints: isj.filter(Boolean).length, jumps: jumps, nodes: n, ms: Date.now()-t0, lengthM: Math.round(total), waypoints:[...]
+  return { ok: true, partial: partialWhy, reachedGates: reached, route: route, jumpPoints: isj.filter(Boolean).length, jumps: jumps, nodes: n, ms: Date.now()-t0, lengthM: Math.round(total), waypoints: wps.map(function (w) { return { name: w.name, x: w.x, y: w.y, z: w.z }; }) };
 }
 
 const WORKER_HELPERS = `
@@ -964,6 +965,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
   if(ch) {
     ch.onmessage=(ev) => {
       const m=ev.data || {};
+      if(m.type==="rec") { try { setRec(!!m.on); } catch(_) {} return; }
       if(m.type==="load" && (m.track||null)===(TRACK_ID||null) && m.data && m.data.n===N && m.data.best &&
          Array.isArray(m.data.best.gt) && Array.isArray(m.data.best.spd) &&
          Array.isArray(m.data.best.offs) && m.data.best.offs.length===N &&
@@ -1347,6 +1349,32 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     }
   }
 
+  // ---- DRIVE RECORDER: records what the human does, bot steps aside ----
+  bot.recOn=false; bot.recS=[]; bot.recLast=-1;
+  function sample(state,ctl,id) {
+    if(!state || !state.hasStarted) return;
+    if(state.frames<bot.recLast) bot.recS.push([-1]);
+    bot.recLast=state.frames;
+    if(state.frames%20!==0) return;
+    if(bot.recS.length>40000) return;
+    const q=state.quaternion, p=state.position;
+    bot.recS.push([state.frames,+p.x.toFixed(2),+p.y.toFixed(2),+p.z.toFixed(2),
+      +q.x.toFixed(4),+q.y.toFixed(4),+q.z.toFixed(4),+q.w.toFixed(4),
+      Math.round(state.speedKmh*10)/10,state.wheels,
+      (ctl&&ctl.up?1:0)|(ctl&&ctl.right?2:0)|(ctl&&ctl.down?4:0)|(ctl&&ctl.left?8:0),state.nextCheckpointIndex]);
+  }
+  function setRec(on) {
+    if(on===bot.recOn) return;
+    bot.recOn=on;
+    if(on) { bot.recS=[]; bot.recLast=-1; bot.enabled=false; console.log("PTBOT_REC started - you drive now"); }
+    else {
+      bot.enabled=true;
+      console.log("PTBOT_REC stopped, "+bot.recS.length+" samples");
+      post({type:"drive",track:TRACK_ID,samples:bot.recS});
+      bot.recS=[];
+    }
+  }
+
   ${generateRoute.toString()}
 
   // ---- ROUTE SWITCHING ----
@@ -1437,6 +1465,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
   } catch(err) { console.log("PTBOT_TRACK hook failed: "+String(err)); }
 
   bot.record=record;
+  bot.sample=sample;
   bot.decode=decode;
   bot.choose=choose;
   bot.route=ROUTE;
@@ -1455,6 +1484,8 @@ const BOT_BODY = `
 
     if (__ptBot.mode === "record") {
       try { __ptBot.record(previous,e.id); } catch (_) {}
+    } else if (__ptBot.recOn) {
+      try { __ptBot.sample(previous,r,e.id); } catch (_) {}
     } else if (__ptBot.enabled) {
       if(previous) r=__ptBot.choose(previous,e.id);
       else r={up:true,right:false,down:false,left:false,reset:false};
@@ -1594,6 +1625,32 @@ function setupMainThread() {
     console.log("saved ptbot_route.json");
   };
 
+  let recOn=false, recToast=null;
+  function toast(t) {
+    try {
+      if(!recToast) {
+        recToast=document.createElement("div");
+        recToast.style.cssText="position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:99999;padding:6px 14px;border-radius:8px;background:#c0262d;color:#fff;font:600 14px sans-serif;pointer-events:none";
+        document.body.appendChild(recToast);
+      }
+      recToast.textContent=t; recToast.style.display=t?"block":"none";
+    } catch (_) {}
+  }
+  window.ptRecord=(on)=>{
+    recOn=(on===undefined)?!recOn:!!on;
+    ch.postMessage({type:"rec",on:recOn});
+    toast(recOn?"RECORDING your driving - press "+REC_KEY.toUpperCase()+" to stop":"");
+    console.log(recOn?"PTBOT_REC on: drive the track yourself, press "+REC_KEY.toUpperCase()+" again when done":"PTBOT_REC off: saving...");
+  };
+  window.ptDriveDump=(withTrack)=>{
+    if(!window.__ptDrive) { console.log("no driving recorded yet - press "+REC_KEY.toUpperCase()+", drive, press "+REC_KEY.toUpperCase()+" again"); return; }
+    ptDownload("ptbot_drive.json",JSON.stringify({drive:window.__ptDrive,track:(withTrack===false)?null:(window.__ptTrack||null)}));
+    console.log("saved ptbot_drive.json ("+window.__ptDrive.samples.length+" samples, with track: "+(withTrack!==false&&!!window.__ptTrack)+")");
+  };
+  try {
+    window.addEventListener("keydown",(e)=>{ const tg=e.target, tn=tg&&tg.tagName; if(tn==="INPUT"||tn==="TEXTAREA"||(tg&&tg.isContentEditable)) return; if(e.key&&e.key.toLowerCase()===REC_KEY&&!e.repeat&&!e.ctrlKey&&!e.metaKey&&!e.altKey) { e.preventDefault(); window.ptRecord(); } },true);
+  } catch (_) {}
+
   function fire(type,k) {
     const ev=new KeyboardEvent(type,{
       key:k.key,code:k.code,keyCode:k.keyCode,which:k.keyCode,bubbles:true,cancelable:true
@@ -1616,6 +1673,10 @@ function setupMainThread() {
     } else if(m.type==="track") {
       window.__ptTrack=m.data;
       console.log("PTBOT_TRACK received on the page: "+m.data.parts.length+" parts, "+(m.data.checkpoints?m.data.checkpoints.length:0)+" checkpoints. Type ptTrackDump() to save it as a file.");
+    } else if(m.type==="drive") {
+      window.__ptDrive=m;
+      console.log("PTBOT_REC saved on the page: "+m.samples.length+" samples. Downloading ptbot_drive.json (type ptDriveDump() to save it again).");
+      window.ptDriveDump();
     } else if(m.type==="route") {
       window.__ptRoute=m;
       console.log("PTBOT_ROUTE (page) line built: "+m.info.points+" points, "+m.info.lengthM+" m, "+m.info.jumps+" jump(s). Type ptRouteDump() to save it as a file.");
@@ -1641,7 +1702,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.7.4";
+    this.modVersion="0.7.5";
     this.touchingPhysics=true;
   }
 
