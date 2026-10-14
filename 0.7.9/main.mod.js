@@ -6,10 +6,10 @@ import { PolyMod, MixinType } from "https://cdn.polymodloader.com/cb/PolyTrackMo
 const MODE = "drive";
 
 // Where the driving line comes from:
-//   "auto"      = generate from this track (never guess a match from start position alone)
-//   "recorded"  = always use the embedded recorded lap; only choose this for its exact track
-//   "generated" = always build a line from this track's geometry
-const ROUTE_SOURCE = "generated";
+//   "auto"      = use your recorded lap if it belongs to the loaded track, otherwise build a line from the track itself
+//   "recorded"  = always use the recorded lap
+//   "generated" = always build a line from the track itself (even on the track you recorded)
+const ROUTE_SOURCE = "auto";
 
 // ---- SELF-LEARNING ----
 const LEARN = true;
@@ -41,14 +41,14 @@ const RESTART_KEY = { key: "t", code: "KeyT", keyCode: 84 };
 
 // ---- DRIVING SETTINGS ----
 const SPEED_FACTOR = 1.0;
-const STEER_GAIN = 2.6; // lower steering duty to reduce sudden over-corrections
-const LAT_ACCEL = 18; // conservative cornering limit: brake for bends sooner
+const STEER_GAIN = 3.5;
+const LAT_ACCEL = 40;
 const SLOW_ZONES = [[5, 17, 95]];
-const LOW_SPEED_BOOST = 0.8; // avoid excessive steering amplification at low speed
-const LINE_PULL = 0.045; // stronger surface-relative correction to hold the route on loops/walls
-const LOOK_BASE = 9; // look farther ahead before reacting to bends
-const LOOK_SPEED = 0.12;
-const LOOK_MAX = 42;
+const LOW_SPEED_BOOST = 2;
+const LINE_PULL = 0.03;
+const LOOK_BASE = 6;
+const LOOK_SPEED = 0.09;
+const LOOK_MAX = 34;
 const DECODE_OFFSET = 4;
 const STEER_SIGN = -1;
 const FORWARD_SIGN = 1;
@@ -164,7 +164,7 @@ const ROUTE = [
 // dec = { parts:[[x,y,z,id,rot,axis,cpo,so,qx,qy,qz,qw],...], lib:{id:{v:[...],detector,startOffset}}, start:{p:[x,y,z]} }
 function generateRoute3D(dec, opt) {
   opt = opt || {};
-  var S = opt.step || 1.3, SPACING = opt.spacing || 3.5, MINCLR = opt.minClr || 3.0, VMAX = opt.vmax || 250;
+  var S = opt.step || 1.3, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.0, VMAX = opt.vmax || 250;
   var GRAV = 16.0, VHS = [12, 35, 55, 75], VH = 55.0;
   var NB = 16, RAD = S*1.7, T0 = Date.now();
 
@@ -375,9 +375,7 @@ function generateRoute3D(dec, opt) {
       if (!fwd && NY[i] > 0.5 && (cnt[i] < 10)) {
         var je = jumpEdges(i, hxA[i], hzA[i], Math.max(-0.5, Math.min(1.0, slA[i])));
         for (var q3 = 0; q3 < je.length; q3++) {
-          // Artificial jump links are much riskier than following a connected road
-          // branch. Keep them as a last resort, not a shortcut across holes.
-          var jj = je[q3][0], dj = je[q3][1], nd3 = dd + dj*5 + 300;
+          var jj = je[q3][0], dj = je[q3][1], nd3 = dd + dj*2 + 80;
           if (nd3 < dist[jj]) {
             dist[jj] = nd3; prev[jj] = i; jumpFrom[jj] = 1;
             var jx = PX[jj]-x1, jz = PZ[jj]-z1, jl = Math.hypot(jx, jz) || 1;
@@ -784,9 +782,7 @@ function generateRoute(dec, opt) {
       if (ncount[i] < 8) {
         var je = jumpEdges(i, hxA[i], hzA[i], slA[i]);
         for (var q3 = 0; q3 < je.length; q3++) {
-          // Artificial jump links are much riskier than following a connected road
-          // branch. Keep them as a last resort, not a shortcut across holes.
-          var jj = je[q3][0], dj = je[q3][1], nd3 = dd + dj*5 + 300;
+          var jj = je[q3][0], dj = je[q3][1], nd3 = dd + dj*2 + 80;
           if (nd3 < dist[jj]) {
             dist[jj] = nd3; prev[jj] = i;
             var jx = nx_(jj)-x1, jz = nz_(jj)-z1, jl = Math.hypot(jx, jz) || 1;
@@ -1047,39 +1043,28 @@ const WORKER_HELPERS = `
   }
 
   function lookAhead(p,ld,i) {
-    // First project the car onto a nearby route segment. Starting the look-ahead
-    // from the car's raw position made it walk back toward a waypoint behind the
-    // car when the car was offset, producing late U-turn-like corrections.
-    const lo=Math.max(0,i-2), hi=Math.min(N-2,i+3);
-    let seg=Math.max(0,Math.min(N-2,i)), bestT=0, bestD=Infinity;
-    let sx=ROUTE[seg][0], sy=ROUTE[seg][1], sz=ROUTE[seg][2];
-    for(let k=lo;k<=hi;k++) {
-      const a=ROUTE[k], b=ROUTE[k+1], flat=flatSeg(k);
-      const dx=b[0]-a[0], dy=flat?0:b[1]-a[1], dz=b[2]-a[2];
-      const px=p.x-a[0], py=flat?0:p.y-a[1], pz=p.z-a[2];
-      const l2=dx*dx+dy*dy+dz*dz;
-      const t=Math.max(0,Math.min(1,l2>1e-9?(px*dx+py*dy+pz*dz)/l2:0));
-      const x=a[0]+(b[0]-a[0])*t, y=a[1]+(b[1]-a[1])*t, z=a[2]+(b[2]-a[2])*t;
-      const ex=p.x-x, ey=p.y-y, ez=p.z-z;
-      const d=ex*ex+ey*ey+ez*ez;
-      // Tie-break toward the later segment so the target progresses forward.
-      if(d<bestD-1e-5 || (Math.abs(d-bestD)<=1e-5 && k>seg)) {
-        bestD=d; seg=k; bestT=t; sx=x; sy=y; sz=z;
-      }
+    let j=i;
+    if(j<N-1) {
+      const dx=ROUTE[j+1][0]-ROUTE[j][0];
+      const dy=flatSeg(j)?0:ROUTE[j+1][1]-ROUTE[j][1];
+      const dz=ROUTE[j+1][2]-ROUTE[j][2];
+      if((p.x-ROUTE[j][0])*dx+(p.y-ROUTE[j][1])*dy+(p.z-ROUTE[j][2])*dz>0) j++;
     }
 
-    let ax=sx, ay=sy, az=sz;
+    let ax=p.x, ay=p.y, az=p.z;
     let remaining=ld;
-    // Consume the remainder of the projected segment, then continue forward.
-    for(let k=seg+1;k<N;k++) {
+
+    for(let k=j;k<N;k++) {
       const bx=ROUTE[k][0], by=ROUTE[k][1], bz=ROUTE[k][2];
       const len=flatSeg(k-1)?Math.hypot(bx-ax,bz-az):Math.hypot(bx-ax,by-ay,bz-az);
       if(len>=remaining) {
         const f=remaining/Math.max(len,1e-9);
         return {x:ax+(bx-ax)*f,y:ay+(by-ay)*f,z:az+(bz-az)*f,index:k};
       }
-      remaining-=len; ax=bx; ay=by; az=bz;
+      remaining-=len;
+      ax=bx; ay=by; az=bz;
     }
+
     const last=ROUTE[N-1];
     return {x:last[0],y:last[1],z:last[2],index:N-1};
   }
@@ -1110,15 +1095,8 @@ const WORKER_HELPERS = `
 
   let CAP=[];
   let SPD=[];
-  let ROUTE_DIST=[];
   function computeDerived() {
   CAP=[];
-  ROUTE_DIST=new Array(N).fill(0);
-  for(let k=1;k<N;k++) {
-    const a=ROUTE[k-1], b=ROUTE[k];
-    const dx=b[0]-a[0], dy=b[1]-a[1], dz=b[2]-a[2];
-    ROUTE_DIST[k]=ROUTE_DIST[k-1]+(flatSeg(k-1)?Math.hypot(dx,dz):Math.hypot(dx,dy,dz));
-  }
   for(let k=0;k<N;k++) {
     let kmax=0;
     for(let m=Math.max(1,k-2);m<=Math.min(N-2,k+2);m++) {
@@ -1184,7 +1162,7 @@ const WORKER_HELPERS = `
     L.run=null; L.runNo=0; L.pending=false; L.pendingFrame=0;
   }
   freshLearner();
-  const DEF = {sp:1, off:0, br:4.5, ab:0}; // lower value starts braking earlier
+  const DEF = {sp:1, off:0, br:6, ab:0};
   function clampv(v,a,b) { return Math.max(a,Math.min(b,v)); }
   function rnd(a) { return (Math.random()*2-1)*a; }
   function post(m) { if(ch) { try { ch.postMessage(m); } catch(_) {} } }
@@ -1431,31 +1409,9 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     return Math.atan2(ROUTE[k][1]-ROUTE[k-1][1],dh);
   }
 
-  // Estimate geometric curvature in full 3D. In a loop, the car must follow the
-  // changing tangent even when that change is not a sideways corner. A long
-  // look-ahead can point across the loop's chord and make the bot steer sharply
-  // toward the ground, so cap look-ahead distance on tight 3D bends.
-  function localPathCurvature(i) {
-    let maxCurv=0;
-    for(let k=Math.max(1,i-2);k<=Math.min(N-2,i+5);k++) {
-      const a=ROUTE[k-1], b=ROUTE[k], c=ROUTE[k+1];
-      const ax=b[0]-a[0], ay=b[1]-a[1], az=b[2]-a[2];
-      const bx=c[0]-b[0], by=c[1]-b[1], bz=c[2]-b[2];
-      const la=Math.hypot(ax,ay,az), lb=Math.hypot(bx,by,bz);
-      if(la<1e-4 || lb<1e-4) continue;
-      const dot=clampv((ax*bx+ay*by+az*bz)/(la*lb),-1,1);
-      const bend=Math.acos(dot);
-      maxCurv=Math.max(maxCurv,bend/Math.max(1e-4,(la+lb)*0.5));
-    }
-    return maxCurv;
-  }
-
   function targetSpeed(i) {
     let best=Infinity;
-    // Preview by physical distance, not a fixed waypoint count (the 3D route now
-    // has denser points). This sees sharp corners early enough to start braking.
-    let hi=i;
-    while(hi<N-1 && hi-i<150 && ROUTE_DIST[hi]-ROUTE_DIST[i]<320) hi++;
+    const hi=Math.min(N-1,i+25);
     const Pi=paramsAt(i);
 
     for(let j=i;j<=hi;j++) {
@@ -1518,9 +1474,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
 
   function choose(state,id) {
     if(!state) return {up:true,right:false,down:false,left:false,reset:false};
-    // If a complete checkpoint-respecting route could not be built, stop safely
-    // instead of blindly accelerating into a hole or wall.
-    if(bot.noRoute) return {up:false,right:false,down:true,left:false,reset:false};
+    if(bot.noRoute) return {up:true,right:false,down:false,left:false,reset:false};
 
     const lf=bot.lastFrames[id];
     if(lf===undefined || state.frames<lf) {
@@ -1592,8 +1546,6 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     }
 
     let ld=Math.max(LOOK_BASE,Math.min(LOOK_MAX,LOOK_BASE+speed*LOOK_SPEED));
-    const pathCurvature=localPathCurvature(i);
-    if(pathCurvature>0.025) ld=Math.min(ld,Math.max(8,Math.min(28,1.15/pathCurvature)));
     let target=lookAhead(state.position,ld,i);
     if(LEARN) {
       const toff=offAt(target.index);
@@ -1907,34 +1859,35 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       if(m.trackData!==lastTrackData) {
         lastTrackData=m.trackData;
         const tid=hashStr(m.trackData);
+        const startP=start ? start.p : null;
+        const recMatches=!!startP && Math.hypot(ROUTE_REC[0][0]-startP[0],ROUTE_REC[0][2]-startP[2])<15;
         let gen=null;
-        if(ROUTE_SOURCE==="recorded") {
-          // Static coordinates do not identify a track. Only use the embedded lap
-          // when the user explicitly selects this mode for the exact matching track.
-          console.log("PTBOT_ROUTE using the explicitly selected recorded lap");
+        if(ROUTE_SOURCE==="recorded" || (ROUTE_SOURCE==="auto" && recMatches)) {
+          console.log("PTBOT_ROUTE using your recorded lap for this track");
           applyRoute(ROUTE_REC,null,"recorded");
         } else {
           const decIn={parts:parts,lib:TRACK_LIB,start:start};
+          let gen3=null;
           if(USE_3D) {
-            let gen3=null;
             try { gen3=generateRoute3D(decIn); } catch(err) { gen3={ok:false,why:"error: "+String(err)}; }
-            if(gen3 && gen3.ok) console.log("PTBOT_ROUTE 3D builder: "+gen3.route.length+" points, "+gen3.lengthM+" m, "+gen3.ms+" ms"+(gen3.partial?" (INCOMPLETE: "+gen3.partial+")":""));
+            if(gen3 && gen3.ok) console.log("PTBOT_ROUTE 3D builder: "+gen3.route.length+" points, "+gen3.lengthM+" m, "+gen3.ms+" ms"+(gen3.partial?" (partial: "+gen3.partial+")":""));
             else console.log("PTBOT_ROUTE 3D builder failed: "+(gen3?gen3.why:"?"));
-
-            // Do not fall back to the flat X-Z projection for a 3D track.
-            // A partial or planar route can cut across a hole/wall or skip a gate.
-            if(gen3 && gen3.ok && !gen3.partial) gen=gen3;
-            else gen={ok:false,why:gen3 && gen3.ok ? "incomplete 3D checkpoint route: "+gen3.partial : (gen3?gen3.why:"3D route builder returned no result")};
-          } else {
-            try { gen=generateRoute(decIn); } catch(err) { gen={ok:false,why:"error: "+String(err)}; }
-            if(gen && gen.ok && gen.partial) gen={ok:false,why:"incomplete checkpoint route: "+gen.partial};
+          }
+          if(gen3 && gen3.ok && !gen3.partial) gen=gen3;
+          else {
+            let gen2=null;
+            try { gen2=generateRoute(decIn); } catch(err) { gen2={ok:false,why:"error: "+String(err)}; }
+            if(gen3 && gen3.ok && (!gen2 || !gen2.ok || (gen2.reachedGates||0)<=(gen3.reachedGates||0))) gen=gen3; else gen=gen2;
           }
           if(gen && gen.ok) {
-            console.log("PTBOT_ROUTE built a COMPLETE line from this track: "+gen.route.length+" points, "+gen.lengthM+" m, "+gen.jumps+" jump(s), "+gen.ms+" ms; ordered checkpoints and finish reached");
+            console.log("PTBOT_ROUTE built a line from the track: "+gen.route.length+" points, "+gen.lengthM+" m, "+gen.jumps+" jump(s), "+gen.ms+" ms");
             applyRoute(gen.route,tid,"generated");
             try { if(ch) ch.postMessage({type:"route",info:{track:tid,points:gen.route.length,lengthM:gen.lengthM,jumps:gen.jumps,ms:gen.ms,waypoints:gen.waypoints},route:gen.route}); } catch(_) {}
+          } else if(ROUTE_SOURCE==="generated" && recMatches) {
+            console.log("PTBOT_ROUTE could not build a line ("+(gen?gen.why:"?")+"), using your recorded lap instead");
+            applyRoute(ROUTE_REC,null,"recorded");
           } else {
-            console.log("PTBOT_ROUTE SAFETY STOP: no complete route through every checkpoint to the finish was built: "+(gen?gen.why:"?")+". Bot will brake instead of guessing a shortcut.");
+            console.log("PTBOT_ROUTE could not build a line: "+(gen?gen.why:"?")+". The bot will only drive forward on this track.");
             bot.noRoute=true;
           }
         }
@@ -2099,7 +2052,7 @@ function setupMainThread() {
   if(RECON) { try { installRecon(); } catch(err) { console.log("PTBOT_RECON failed",err); } }
   if(typeof BroadcastChannel==="undefined") return;
   const ch=new BroadcastChannel("ptbot");
-  const STORE_BASE="ptbot_learn_v6";
+  const STORE_BASE="ptbot_learn_v5";
   const storeKey=(t)=>t?STORE_BASE+"_"+t:STORE_BASE;
 
   window.ptTrackDump=()=>{
@@ -2194,7 +2147,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.7.8";
+    this.modVersion="0.7.9";
     this.touchingPhysics=true;
   }
 
