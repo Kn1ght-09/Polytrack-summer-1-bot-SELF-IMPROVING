@@ -31,6 +31,7 @@ const SPEED_VALUE = 0.8;
 const MAX_LINE_SHIFT = 6;
 const MAX_SPEED_SHIFT = 0.2;
 const EXPLORE_RUNS = 60;
+const DOWNLOAD_DRIVE = false; // true = also save a ptbot_drive.json file every time you stop recording
 const USE_3D = true; // build lines on the road surface itself (ramps, banks, walls, loops); false = old flat-road builder
 const REC_KEY = "o"; // press once to start recording YOUR driving (bot steps aside), press again to stop and save
 const AUTO_RESTART = true;
@@ -1382,6 +1383,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     ch.onmessage=(ev) => {
       const m=ev.data || {};
       if(m.type==="rec") { try { setRec(!!m.on); } catch(_) {} return; }
+      if(m.type==="patches" && (m.track||null)===(TRACK_ID||null)) { try { loadLessons(m.list); } catch(err) { console.log("PTBOT_LESSON load failed: "+String(err)); } return; }
+      if(m.type==="clearPatches") { try { clearLessons(); } catch(_) {} return; }
       if(m.type==="load" && (m.track||null)===(TRACK_ID||null) && m.data && m.data.n===N && m.data.best &&
          Array.isArray(m.data.best.gt) && Array.isArray(m.data.best.spd) &&
          Array.isArray(m.data.best.offs) && m.data.best.offs.length===N &&
@@ -1801,9 +1804,73 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     else {
       bot.enabled=true;
       console.log("PTBOT_REC stopped, "+bot.recS.length+" samples");
-      post({type:"drive",track:TRACK_ID,samples:bot.recS});
-      bot.recS=[];
+      const samples=bot.recS; bot.recS=[];
+      post({type:"drive",track:TRACK_ID,samples:samples});
+      try { learnLesson(samples); } catch(err) { console.log("PTBOT_LESSON failed: "+String(err)); }
     }
+  }
+
+  // ---- LESSONS: your driving replaces that part of the bot's line (and is remembered for this track) ----
+  bot.patches=[]; bot.baseRoute=ROUTE_REC; bot.baseKind="recorded";
+  function buildPatch(samples) {
+    let cut=-1;
+    for(let i=0;i<samples.length;i++) if(samples[i].length===1) cut=i;
+    const s=samples.slice(cut+1);
+    if(s.length<8) return null;
+    const pts=[];
+    for(const a of s) {
+      const air=(a[9]===0);
+      const u=air ? {x:0,y:1,z:0} : rotateVec({x:a[4],y:a[5],z:a[6],w:a[7]},{x:0,y:1,z:0});
+      pts.push([a[1],a[2],a[3],Math.max(20,a[8]),u.x,u.y,u.z]);
+    }
+    const out=[pts[0]]; let acc=0;
+    for(let i=1;i<pts.length;i++) {
+      acc+=Math.hypot(pts[i][0]-pts[i-1][0],pts[i][1]-pts[i-1][1],pts[i][2]-pts[i-1][2]);
+      if(acc>=5 || i===pts.length-1) { out.push(pts[i]); acc=0; }
+    }
+    return out.map(p=>[+p[0].toFixed(2),+p[1].toFixed(2),+p[2].toFixed(2),Math.round(p[3]),+p[4].toFixed(2),+p[5].toFixed(2),+p[6].toFixed(2)]);
+  }
+  function spliceRoute(base,patch) {
+    function nearest(p,lo,hi) {
+      let b=-1,bd=1e18;
+      for(let i=lo;i<=hi;i++) {
+        const d=(base[i][0]-p[0])*(base[i][0]-p[0])+(base[i][1]-p[1])*(base[i][1]-p[1])+(base[i][2]-p[2])*(base[i][2]-p[2]);
+        if(d<bd) { bd=d; b=i; }
+      }
+      return [b,Math.sqrt(bd)];
+    }
+    const last=base.length-1;
+    const a=nearest(patch[0],0,last);
+    if(a[0]<0 || a[1]>60) return null;
+    const b=nearest(patch[patch.length-1],Math.min(last,a[0]+1),last);
+    if(b[0]<0 || b[1]>60) return null;
+    return base.slice(0,a[0]).concat(patch,base.slice(b[0]+1));
+  }
+  function learnLesson(samples) {
+    const patch=buildPatch(samples);
+    if(!patch) { post({type:"lesson",text:"Lesson too short - drive a bit further"}); console.log("PTBOT_LESSON too short, nothing saved"); return; }
+    const route=spliceRoute(ROUTE,patch);
+    if(!route) { post({type:"lesson",text:"Your driving never touched the bot's line - nothing saved"}); console.log("PTBOT_LESSON your drive is more than 60 m away from the bot's line, nothing saved"); return; }
+    bot.patches.push(patch);
+    applyRoute(route,TRACK_ID,"patched",true);
+    post({type:"patches_save",track:TRACK_ID,list:bot.patches});
+    post({type:"lesson",text:"Lesson learned: "+patch.length+" points from your driving now guide the bot here"});
+    console.log("PTBOT_LESSON learned "+patch.length+" points ("+Math.round(patch[0][0])+","+Math.round(patch[0][2])+") -> ("+Math.round(patch[patch.length-1][0])+","+Math.round(patch[patch.length-1][2])+"); route is now "+N+" points");
+  }
+  function loadLessons(list) {
+    if(!Array.isArray(list) || !list.length || !bot.baseRoute) return;
+    let route=bot.baseRoute, used=[];
+    for(const p of list) { const r=Array.isArray(p) && p.length>=2 ? spliceRoute(route,p) : null; if(r) { route=r; used.push(p); } }
+    if(!used.length) return;
+    bot.patches=used;
+    applyRoute(route,TRACK_ID,"patched",true);
+    console.log("PTBOT_LESSON loaded "+used.length+" saved lesson(s) for this track");
+  }
+  function clearLessons() {
+    bot.patches=[];
+    if(bot.baseRoute) applyRoute(bot.baseRoute,TRACK_ID,bot.baseKind,true);
+    post({type:"patches_save",track:TRACK_ID,list:[]});
+    console.log("PTBOT_LESSON all lessons cleared for this track");
   }
 
   ${generateRoute.toString()}
@@ -1813,13 +1880,14 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
   // ---- ROUTE SWITCHING ----
   const PER_CAR=["idx","acc","stuck","lastPos","lastFrames","hist","lastCrash","lastOff","lastCp","airSince","airV0",
     "lastAirborne","keepSpeed","keepUntil","lastLand","lastBrakeLog","landSteerUntil","lastPitch","airMatched","finLogged"];
-  function applyRoute(route,trackId,kind) {
+  function applyRoute(route,trackId,kind,quiet) {
+    if(!quiet) { bot.baseRoute=route; bot.baseKind=kind; bot.patches=[]; }
     ROUTE=route; N=route.length; TRACK_ID=trackId;
     SLOW_ZONES = kind==="recorded" ? SLOW_ZONES_REC.slice() : [];
     computeDerived();
     for(const k of PER_CAR) bot[k]=Object.create(null);
     bot.route=ROUTE; bot.noRoute=false; bot.routeKind=kind;
-    if(LEARN) { freshLearner(); post({type:"hello",track:TRACK_ID}); startRun(); }
+    if(LEARN) { freshLearner(); if(!quiet) post({type:"hello",track:TRACK_ID}); startRun(); }
   }
   function hashStr(t) { let h=5381; for(let i=0;i<t.length;i++) h=((h*33)^t.charCodeAt(i))>>>0; return h.toString(16); }
   let lastTrackData=null;
@@ -2053,6 +2121,9 @@ function setupMainThread() {
   if(typeof BroadcastChannel==="undefined") return;
   const ch=new BroadcastChannel("ptbot");
   const STORE_BASE="ptbot_learn_v5";
+  const PATCH_BASE="ptbot_patch_v1";
+  let lastTrackKey=null;
+  const patchKey=(t)=>PATCH_BASE+"_"+(t||"default");
   const storeKey=(t)=>t?STORE_BASE+"_"+t:STORE_BASE;
 
   window.ptTrackDump=()=>{
@@ -2084,9 +2155,10 @@ function setupMainThread() {
   window.ptRecord=(on)=>{
     recOn=(on===undefined)?!recOn:!!on;
     ch.postMessage({type:"rec",on:recOn});
-    toast(recOn?"RECORDING your driving - press "+REC_KEY.toUpperCase()+" to stop":"");
+    toast(recOn?"TEACHING: drive the hard spot yourself, then press "+REC_KEY.toUpperCase()+" again":"");
     console.log(recOn?"PTBOT_REC on: drive the track yourself, press "+REC_KEY.toUpperCase()+" again when done":"PTBOT_REC off: saving...");
   };
+  window.ptClearLessons=()=>{ ch.postMessage({type:"clearPatches"}); try { localStorage.removeItem(patchKey(lastTrackKey)); } catch (_) {} console.log("lessons cleared for this track"); };
   window.ptDriveDump=(withTrack)=>{
     if(!window.__ptDrive) { console.log("no driving recorded yet - press "+REC_KEY.toUpperCase()+", drive, press "+REC_KEY.toUpperCase()+" again"); return; }
     ptDownload("ptbot_drive.json",JSON.stringify({drive:window.__ptDrive,track:(withTrack===false)?null:(window.__ptTrack||null)}));
@@ -2111,17 +2183,29 @@ function setupMainThread() {
   ch.onmessage=ev=>{
     const m=ev.data||{};
     if(m.type==="hello") {
+      lastTrackKey=m.track||null;
       try {
         const d=localStorage.getItem(storeKey(m.track));
         ch.postMessage({type:"load",track:m.track||null,data:d?JSON.parse(d):null});
       } catch (_) {}
+      try {
+        const pl=localStorage.getItem(patchKey(m.track));
+        if(pl) ch.postMessage({type:"patches",track:m.track||null,list:JSON.parse(pl)});
+      } catch (_) {}
+    } else if(m.type==="patches_save") {
+      try {
+        if(m.list&&m.list.length) localStorage.setItem(patchKey(m.track),JSON.stringify(m.list)); else localStorage.removeItem(patchKey(m.track));
+      } catch (_) {}
+    } else if(m.type==="lesson") {
+      toast(m.text); console.log("PTBOT_LESSON "+m.text);
+      setTimeout(()=>{ if(!recOn) toast(""); },5000);
     } else if(m.type==="track") {
       window.__ptTrack=m.data;
       console.log("PTBOT_TRACK received on the page: "+m.data.parts.length+" parts, "+(m.data.checkpoints?m.data.checkpoints.length:0)+" checkpoints. Type ptTrackDump() to save it as a file.");
     } else if(m.type==="drive") {
       window.__ptDrive=m;
-      console.log("PTBOT_REC saved on the page: "+m.samples.length+" samples. Downloading ptbot_drive.json (type ptDriveDump() to save it again).");
-      window.ptDriveDump();
+      console.log("PTBOT_REC saved on the page: "+m.samples.length+" samples (type ptDriveDump() to save them as a file).");
+      if(DOWNLOAD_DRIVE) window.ptDriveDump();
     } else if(m.type==="route") {
       window.__ptRoute=m;
       console.log("PTBOT_ROUTE (page) line built: "+m.info.points+" points, "+m.info.lengthM+" m, "+m.info.jumps+" jump(s). Type ptRouteDump() to save it as a file.");
@@ -2147,7 +2231,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.7.9";
+    this.modVersion="0.8.0";
     this.touchingPhysics=true;
   }
 
