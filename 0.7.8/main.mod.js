@@ -6,10 +6,10 @@ import { PolyMod, MixinType } from "https://cdn.polymodloader.com/cb/PolyTrackMo
 const MODE = "drive";
 
 // Where the driving line comes from:
-//   "auto"      = use your recorded lap if it belongs to the loaded track, otherwise build a line from the track itself
-//   "recorded"  = always use the recorded lap
-//   "generated" = always build a line from the track itself (even on the track you recorded)
-const ROUTE_SOURCE = "auto";
+//   "auto"      = generate from this track (never guess a match from start position alone)
+//   "recorded"  = always use the embedded recorded lap; only choose this for its exact track
+//   "generated" = always build a line from this track's geometry
+const ROUTE_SOURCE = "generated";
 
 // ---- SELF-LEARNING ----
 const LEARN = true;
@@ -375,7 +375,9 @@ function generateRoute3D(dec, opt) {
       if (!fwd && NY[i] > 0.5 && (cnt[i] < 10)) {
         var je = jumpEdges(i, hxA[i], hzA[i], Math.max(-0.5, Math.min(1.0, slA[i])));
         for (var q3 = 0; q3 < je.length; q3++) {
-          var jj = je[q3][0], dj = je[q3][1], nd3 = dd + dj*2 + 80;
+          // Artificial jump links are much riskier than following a connected road
+          // branch. Keep them as a last resort, not a shortcut across holes.
+          var jj = je[q3][0], dj = je[q3][1], nd3 = dd + dj*5 + 300;
           if (nd3 < dist[jj]) {
             dist[jj] = nd3; prev[jj] = i; jumpFrom[jj] = 1;
             var jx = PX[jj]-x1, jz = PZ[jj]-z1, jl = Math.hypot(jx, jz) || 1;
@@ -782,7 +784,9 @@ function generateRoute(dec, opt) {
       if (ncount[i] < 8) {
         var je = jumpEdges(i, hxA[i], hzA[i], slA[i]);
         for (var q3 = 0; q3 < je.length; q3++) {
-          var jj = je[q3][0], dj = je[q3][1], nd3 = dd + dj*2 + 80;
+          // Artificial jump links are much riskier than following a connected road
+          // branch. Keep them as a last resort, not a shortcut across holes.
+          var jj = je[q3][0], dj = je[q3][1], nd3 = dd + dj*5 + 300;
           if (nd3 < dist[jj]) {
             dist[jj] = nd3; prev[jj] = i;
             var jx = nx_(jj)-x1, jz = nz_(jj)-z1, jl = Math.hypot(jx, jz) || 1;
@@ -1514,7 +1518,9 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
 
   function choose(state,id) {
     if(!state) return {up:true,right:false,down:false,left:false,reset:false};
-    if(bot.noRoute) return {up:true,right:false,down:false,left:false,reset:false};
+    // If a complete checkpoint-respecting route could not be built, stop safely
+    // instead of blindly accelerating into a hole or wall.
+    if(bot.noRoute) return {up:false,right:false,down:true,left:false,reset:false};
 
     const lf=bot.lastFrames[id];
     if(lf===undefined || state.frames<lf) {
@@ -1901,35 +1907,34 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       if(m.trackData!==lastTrackData) {
         lastTrackData=m.trackData;
         const tid=hashStr(m.trackData);
-        const startP=start ? start.p : null;
-        const recMatches=!!startP && Math.hypot(ROUTE_REC[0][0]-startP[0],ROUTE_REC[0][2]-startP[2])<15;
         let gen=null;
-        if(ROUTE_SOURCE==="recorded" || (ROUTE_SOURCE==="auto" && recMatches)) {
-          console.log("PTBOT_ROUTE using your recorded lap for this track");
+        if(ROUTE_SOURCE==="recorded") {
+          // Static coordinates do not identify a track. Only use the embedded lap
+          // when the user explicitly selects this mode for the exact matching track.
+          console.log("PTBOT_ROUTE using the explicitly selected recorded lap");
           applyRoute(ROUTE_REC,null,"recorded");
         } else {
           const decIn={parts:parts,lib:TRACK_LIB,start:start};
-          let gen3=null;
           if(USE_3D) {
+            let gen3=null;
             try { gen3=generateRoute3D(decIn); } catch(err) { gen3={ok:false,why:"error: "+String(err)}; }
-            if(gen3 && gen3.ok) console.log("PTBOT_ROUTE 3D builder: "+gen3.route.length+" points, "+gen3.lengthM+" m, "+gen3.ms+" ms"+(gen3.partial?" (partial: "+gen3.partial+")":""));
+            if(gen3 && gen3.ok) console.log("PTBOT_ROUTE 3D builder: "+gen3.route.length+" points, "+gen3.lengthM+" m, "+gen3.ms+" ms"+(gen3.partial?" (INCOMPLETE: "+gen3.partial+")":""));
             else console.log("PTBOT_ROUTE 3D builder failed: "+(gen3?gen3.why:"?"));
-          }
-          if(gen3 && gen3.ok && !gen3.partial) gen=gen3;
-          else {
-            let gen2=null;
-            try { gen2=generateRoute(decIn); } catch(err) { gen2={ok:false,why:"error: "+String(err)}; }
-            if(gen3 && gen3.ok && (!gen2 || !gen2.ok || (gen2.reachedGates||0)<=(gen3.reachedGates||0))) gen=gen3; else gen=gen2;
+
+            // Do not fall back to the flat X-Z projection for a 3D track.
+            // A partial or planar route can cut across a hole/wall or skip a gate.
+            if(gen3 && gen3.ok && !gen3.partial) gen=gen3;
+            else gen={ok:false,why:gen3 && gen3.ok ? "incomplete 3D checkpoint route: "+gen3.partial : (gen3?gen3.why:"3D route builder returned no result")};
+          } else {
+            try { gen=generateRoute(decIn); } catch(err) { gen={ok:false,why:"error: "+String(err)}; }
+            if(gen && gen.ok && gen.partial) gen={ok:false,why:"incomplete checkpoint route: "+gen.partial};
           }
           if(gen && gen.ok) {
-            console.log("PTBOT_ROUTE built a line from the track: "+gen.route.length+" points, "+gen.lengthM+" m, "+gen.jumps+" jump(s), "+gen.ms+" ms");
+            console.log("PTBOT_ROUTE built a COMPLETE line from this track: "+gen.route.length+" points, "+gen.lengthM+" m, "+gen.jumps+" jump(s), "+gen.ms+" ms; ordered checkpoints and finish reached");
             applyRoute(gen.route,tid,"generated");
             try { if(ch) ch.postMessage({type:"route",info:{track:tid,points:gen.route.length,lengthM:gen.lengthM,jumps:gen.jumps,ms:gen.ms,waypoints:gen.waypoints},route:gen.route}); } catch(_) {}
-          } else if(ROUTE_SOURCE==="generated" && recMatches) {
-            console.log("PTBOT_ROUTE could not build a line ("+(gen?gen.why:"?")+"), using your recorded lap instead");
-            applyRoute(ROUTE_REC,null,"recorded");
           } else {
-            console.log("PTBOT_ROUTE could not build a line: "+(gen?gen.why:"?")+". The bot will only drive forward on this track.");
+            console.log("PTBOT_ROUTE SAFETY STOP: no complete route through every checkpoint to the finish was built: "+(gen?gen.why:"?")+". Bot will brake instead of guessing a shortcut.");
             bot.noRoute=true;
           }
         }
@@ -2189,7 +2194,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.7.7";
+    this.modVersion="0.7.8";
     this.touchingPhysics=true;
   }
 
