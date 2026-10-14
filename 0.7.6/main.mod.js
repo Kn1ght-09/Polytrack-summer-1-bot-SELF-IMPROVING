@@ -31,6 +31,7 @@ const SPEED_VALUE = 0.8;
 const MAX_LINE_SHIFT = 6;
 const MAX_SPEED_SHIFT = 0.2;
 const EXPLORE_RUNS = 60;
+const USE_3D = true; // build lines on the road surface itself (ramps, banks, walls, loops); false = old flat-road builder
 const REC_KEY = "o"; // press once to start recording YOUR driving (bot steps aside), press again to stop and save
 const AUTO_RESTART = true;
 const AUTO_START = true;
@@ -161,6 +162,386 @@ const ROUTE = [
 // Builds a driving line from the track pieces (runs inside the physics worker).
 // Self-contained: builds a driving line for any track. No outside references.
 // dec = { parts:[[x,y,z,id,rot,axis,cpo,so,qx,qy,qz,qw],...], lib:{id:{v:[...],detector,startOffset}}, start:{p:[x,y,z]} }
+function generateRoute3D(dec, opt) {
+  opt = opt || {};
+  var S = opt.step || 1.3, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.0, VMAX = opt.vmax || 250;
+  var GRAV = 16.0, VHS = [12, 35, 55, 75], VH = 55.0;
+  var NB = 16, RAD = S*1.7, T0 = Date.now();
+
+  function qrot(q, x, y, z) {
+    var n = Math.sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]) || 1;
+    var qx=q[0]/n, qy=q[1]/n, qz=q[2]/n, qw=q[3]/n;
+    return [
+      (1-2*(qy*qy+qz*qz))*x + 2*(qx*qy-qz*qw)*y + 2*(qx*qz+qy*qw)*z,
+      2*(qx*qy+qz*qw)*x + (1-2*(qx*qx+qz*qz))*y + 2*(qy*qz-qx*qw)*z,
+      2*(qx*qz-qy*qw)*x + 2*(qy*qz+qx*qw)*y + (1-2*(qx*qx+qy*qy))*z
+    ];
+  }
+
+  // ---- 1. surface samples: every face of every part, with its outward normal ----
+  var cap = 200000, PX = new Float32Array(cap), PY = new Float32Array(cap), PZ = new Float32Array(cap);
+  var NX = new Float32Array(cap), NY = new Float32Array(cap), NZ = new Float32Array(cap);
+  var n = 0, seen = new Set();
+  function grow() {
+    cap *= 2;
+    function g(a) { var b = new Float32Array(cap); b.set(a); return b; }
+    PX = g(PX); PY = g(PY); PZ = g(PZ); NX = g(NX); NY = g(NY); NZ = g(NZ);
+  }
+  function addNode(x, y, z, nx, ny, nz) {
+    var ax = Math.abs(nx), ay = Math.abs(ny), az = Math.abs(nz);
+    var dom = ax >= ay && ax >= az ? (nx > 0 ? 0 : 1) : (ay >= az ? (ny > 0 ? 2 : 3) : (nz > 0 ? 4 : 5));
+    var key = (((Math.floor(x/0.6)+8192)*16384 + (Math.floor(y/0.6)+8192))*16384 + (Math.floor(z/0.6)+8192))*8 + dom;
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (n >= cap) grow();
+    PX[n] = x; PY[n] = y; PZ[n] = z; NX[n] = nx; NY[n] = ny; NZ[n] = nz; n++;
+  }
+  for (var pi = 0; pi < dec.parts.length; pi++) {
+    var p = dec.parts[pi], e = dec.lib[p[3]];
+    if (!e) continue;
+    var v = e.v, q = [p[8], p[9], p[10], p[11]], ox = p[0]*5, oy = p[1]*5, oz = p[2]*5;
+    for (var i = 0; i + 8 < v.length; i += 9) {
+      var a = qrot(q, v[i], v[i+1], v[i+2]), b = qrot(q, v[i+3], v[i+4], v[i+5]), c = qrot(q, v[i+6], v[i+7], v[i+8]);
+      a[0]+=ox; a[1]+=oy; a[2]+=oz; b[0]+=ox; b[1]+=oy; b[2]+=oz; c[0]+=ox; c[1]+=oy; c[2]+=oz;
+      var ux=b[0]-a[0], uy=b[1]-a[1], uz=b[2]-a[2], wx=c[0]-a[0], wy=c[1]-a[1], wz=c[2]-a[2];
+      var tx=uy*wz-uz*wy, ty=uz*wx-ux*wz, tz=ux*wy-uy*wx, L=Math.sqrt(tx*tx+ty*ty+tz*tz);
+      if (L < 1e-9) continue;
+      tx/=L; ty/=L; tz/=L;
+      var nu = Math.max(1, Math.ceil(Math.sqrt(ux*ux+uy*uy+uz*uz)/S)), nv = Math.max(1, Math.ceil(Math.sqrt(wx*wx+wy*wy+wz*wz)/S));
+      for (var iu = 0; iu <= nu; iu++) for (var iv = 0; iv <= nv; iv++) {
+        var fu = iu/nu, fv = iv/nv;
+        if (fu + fv > 1.0001) continue;
+        addNode(a[0]+ux*fu+wx*fv, a[1]+uy*fu+wy*fv, a[2]+uz*fu+wz*fv, tx, ty, tz);
+      }
+      if (n > 2500000) return { ok: false, why: "track too large" };
+    }
+  }
+  seen = null;
+  if (n < 50) return { ok: false, why: "no surfaces found" };
+
+  // ---- 2. spatial hash (cell = 1.8 m) ----
+  var CS = Math.max(1.8, RAD), HS = 1 << 22, HM = HS - 1;
+  var head = new Int32Array(HS).fill(-1), nxt = new Int32Array(n), CX = new Int32Array(n), CY = new Int32Array(n), CZ = new Int32Array(n);
+  function hsh(ix, iy, iz) { return (((ix*73856093) ^ (iy*19349663) ^ (iz*83492791)) >>> 0) & HM; }
+  for (var h0 = 0; h0 < n; h0++) {
+    var ix = Math.floor(PX[h0]/CS), iy = Math.floor(PY[h0]/CS), iz = Math.floor(PZ[h0]/CS);
+    CX[h0] = ix; CY[h0] = iy; CZ[h0] = iz;
+    var hh = hsh(ix, iy, iz); nxt[h0] = head[hh]; head[hh] = h0;
+  }
+  function near(x, y, z, r, fn) {
+    var ix = Math.floor(x/CS), iy = Math.floor(y/CS), iz = Math.floor(z/CS);
+    for (var a = -1; a <= 1; a++) for (var b = -1; b <= 1; b++) for (var c = -1; c <= 1; c++) {
+      var jx = ix+a, jy = iy+b, jz = iz+c;
+      for (var j = head[hsh(jx, jy, jz)]; j >= 0; j = nxt[j]) {
+        if (CX[j] !== jx || CY[j] !== jy || CZ[j] !== jz) continue;
+        fn(j);
+      }
+    }
+  }
+
+  // ---- 3. blocked: something solid just above the surface (walls, curbs, ceilings) ----
+  var blocked = new Uint8Array(n);
+  for (var i1 = 0; i1 < n; i1++) {
+    var bx = PX[i1], by = PY[i1], bz = PZ[i1], bnx = NX[i1], bny = NY[i1], bnz = NZ[i1], hit = false;
+    near(bx, by, bz, 1.8, function (j) {
+      if (hit || j === i1) return;
+      var dx = PX[j]-bx, dy = PY[j]-by, dz = PZ[j]-bz, hgt = dx*bnx + dy*bny + dz*bnz;
+      if (hgt < 0.6 || hgt > 1.8) return;
+      var pr = dx*dx+dy*dy+dz*dz - hgt*hgt;
+      if (pr <= 0.64) hit = true;
+    });
+    if (hit) blocked[i1] = 1;
+  }
+
+  // ---- 4. smooth neighbours: close, same surface, similar direction ----
+  var nbr = new Int32Array(n*NB).fill(-1), cnt = new Uint8Array(n);
+  for (var i2 = 0; i2 < n; i2++) {
+    if (blocked[i2]) continue;
+    var cx0 = PX[i2], cy0 = PY[i2], cz0 = PZ[i2], n0x = NX[i2], n0y = NY[i2], n0z = NZ[i2], k = 0;
+    near(cx0, cy0, cz0, RAD, function (j) {
+      if (j === i2 || blocked[j] || k >= NB) return;
+      var dx = PX[j]-cx0, dy = PY[j]-cy0, dz = PZ[j]-cz0, d2 = dx*dx+dy*dy+dz*dz;
+      if (d2 > RAD*RAD || d2 < 0.01) return;
+      if (n0x*NX[j] + n0y*NY[j] + n0z*NZ[j] < 0.82) return;
+      var d = Math.sqrt(d2);
+      if (Math.abs(dx*n0x+dy*n0y+dz*n0z) > 0.4*d || Math.abs(dx*NX[j]+dy*NY[j]+dz*NZ[j]) > 0.4*d) return;
+      nbr[i2*NB + k] = j; k++;
+    });
+    cnt[i2] = k;
+  }
+
+  // ---- heap ----
+  function Heap() { this.k = []; this.v = []; }
+  Heap.prototype.push = function (key, val) {
+    var k = this.k, v = this.v, i = k.length; k.push(key); v.push(val);
+    while (i > 0) { var pr = (i-1) >> 1; if (k[pr] <= key) break; k[i] = k[pr]; v[i] = v[pr]; i = pr; }
+    k[i] = key; v[i] = val;
+  };
+  Heap.prototype.pop = function () {
+    var k = this.k, v = this.v, tk = k[0], tv = v[0], lk = k.pop(), lv = v.pop(), len = k.length;
+    if (len > 0) {
+      var i = 0;
+      for (;;) { var c = 2*i+1; if (c >= len) break; if (c+1 < len && k[c+1] < k[c]) c++; if (k[c] >= lk) break; k[i] = k[c]; v[i] = v[c]; i = c; }
+      k[i] = lk; v[i] = lv;
+    }
+    return [tk, tv];
+  };
+  Heap.prototype.size = function () { return this.k.length; };
+
+  // ---- 5. clearance = distance along the surface to the nearest edge ----
+  var clr = new Float64Array(n).fill(1e9), hp = new Heap();
+  for (var i3 = 0; i3 < n; i3++) if (!blocked[i3] && cnt[i3] < 6) { clr[i3] = 0.5; hp.push(0.5, i3); }
+  while (hp.size()) {
+    var tp = hp.pop(), dc = tp[0], ic = tp[1];
+    if (dc > clr[ic]) continue;
+    for (var q2 = 0; q2 < cnt[ic]; q2++) {
+      var jn = nbr[ic*NB+q2], nd2 = dc + Math.hypot(PX[jn]-PX[ic], PY[jn]-PY[ic], PZ[jn]-PZ[ic]);
+      if (nd2 < clr[jn]) { clr[jn] = nd2; hp.push(nd2, jn); }
+    }
+  }
+
+  function nearestNode(x, y, z, needUp) {
+    var best = -1, bd = 1e18;
+    for (var rr = 1; rr <= 4 && best < 0; rr++) {
+      var R = rr*1.6;
+      var ix = Math.floor(x/CS), iy = Math.floor(y/CS), iz = Math.floor(z/CS), m = Math.ceil(R/CS);
+      for (var a = -m; a <= m; a++) for (var b = -m; b <= m; b++) for (var c = -m; c <= m; c++) {
+        var jx = ix+a, jy = iy+b, jz = iz+c;
+        for (var j = head[hsh(jx, jy, jz)]; j >= 0; j = nxt[j]) {
+          if (CX[j] !== jx || CY[j] !== jy || CZ[j] !== jz) continue;
+          if (blocked[j] || !cnt[j]) continue;
+          if (needUp && NY[j] < 0.5) continue;
+          var d2 = (PX[j]-x)*(PX[j]-x) + (PY[j]-y)*(PY[j]-y) + (PZ[j]-z)*(PZ[j]-z);
+          if (d2 < bd) { bd = d2; best = j; }
+        }
+      }
+    }
+    return best;
+  }
+
+  // ---- 6. jumps: leave the end of a surface, fly, land on the first surface below ----
+  function jumpEdges(i, hx, hz, slope) {
+    var x0 = PX[i], y0 = PY[i], z0 = PZ[i], out = new Map(), angs = [-12,-8,-4,0,4,8,12];
+    for (var vi = 0; vi < VHS.length; vi++) for (var ai = 0; ai < angs.length; ai++) {
+      var vh = VHS[vi], ar = angs[ai]*Math.PI/180, c = Math.cos(ar), s = Math.sin(ar);
+      var dx = hx*c - hz*s, dz = hx*s + hz*c, found = -1;
+      for (var d = 3; d <= 150 && found < 0; d += 1) {
+        var ty = y0 + slope*d - GRAV*d*d/(2*vh*vh), x = x0+dx*d, z = z0+dz*d;
+        if (ty < minY - 3) break;
+        near(x, ty, z, 1.2, function (j) {
+          if (found >= 0 || blocked[j] || !cnt[j] || NY[j] < 0.5) return;
+          var df = ty - PY[j], hd = Math.hypot(PX[j]-x, PZ[j]-z);
+          if (hd <= 0.9 && df >= -1.2 && df <= 0.6) found = j;
+        });
+        if (found >= 0) { if (clr[found] >= 3.0 && (!out.has(found) || out.get(found) > d)) out.set(found, d); }
+      }
+    }
+    var res = []; out.forEach(function (d, j) { res.push([j, d]); });
+    return res;
+  }
+  var minY = 1e9;
+  for (var iy2 = 0; iy2 < n; iy2++) if (PY[iy2] < minY) minY = PY[iy2];
+
+  // ---- 7. search ----
+  var dist = new Float64Array(n), prev = new Int32Array(n), hxA = new Float32Array(n), hzA = new Float32Array(n), slA = new Float32Array(n);
+  var jumpFrom = new Uint8Array(n);
+  function search(src, goal) {
+    var dst = -1;
+    dist.fill(1e18); prev.fill(-1); jumpFrom.fill(0);
+    dist[src] = 0; hxA[src] = 1; hzA[src] = 0; slA[src] = 0;
+    var pq = new Heap(); pq.push(0, src);
+    while (pq.size()) {
+      var tp = pq.pop(), dd = tp[0], i = tp[1];
+      if (dd > dist[i]) continue;
+      if (goal[i] && i !== src) { dst = i; break; }
+      var x1 = PX[i], y1 = PY[i], z1 = PZ[i], fwd = false;
+      for (var q = 0; q < cnt[i]; q++) {
+        var j = nbr[i*NB+q], x2 = PX[j], y2 = PY[j], z2 = PZ[j];
+        var Ld = Math.sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1)+(z2-z1)*(z2-z1)), cj = clr[j];
+        var pen = 1 + 8*Math.pow(Math.max(0, (4-cj)/4), 2);
+        if (cj < 1.5) pen += 40;
+        var nd = dd + Ld*pen;
+        var hl = Math.hypot(x2-x1, z2-z1);
+        if (hl > 0.3 && ((x2-x1)*hxA[i] + (z2-z1)*hzA[i]) / hl > 0.5) fwd = true;
+        if (nd < dist[j]) {
+          dist[j] = nd; prev[j] = i; jumpFrom[j] = 0;
+          if (hl > 0.2) {
+            var ux = (x2-x1)/hl, uz = (z2-z1)/hl, mx = hxA[i]*0.8 + ux*0.2, mz = hzA[i]*0.8 + uz*0.2, ml = Math.hypot(mx, mz) || 1;
+            hxA[j] = mx/ml; hzA[j] = mz/ml; slA[j] = slA[i]*0.8 + 0.2*(y2-y1)/hl;
+          } else { hxA[j] = hxA[i]; hzA[j] = hzA[i]; slA[j] = slA[i]; }
+          pq.push(nd, j);
+        }
+      }
+      if (!fwd && NY[i] > 0.5 && (cnt[i] < 10)) {
+        var je = jumpEdges(i, hxA[i], hzA[i], Math.max(-0.5, Math.min(1.0, slA[i])));
+        for (var q3 = 0; q3 < je.length; q3++) {
+          var jj = je[q3][0], dj = je[q3][1], nd3 = dd + dj*2 + 80;
+          if (nd3 < dist[jj]) {
+            dist[jj] = nd3; prev[jj] = i; jumpFrom[jj] = 1;
+            var jx = PX[jj]-x1, jz = PZ[jj]-z1, jl = Math.hypot(jx, jz) || 1;
+            hxA[jj] = jx/jl; hzA[jj] = jz/jl; slA[jj] = -0.3;
+            pq.push(nd3, jj);
+          }
+        }
+      }
+    }
+    search.approx = false;
+    if (dst < 0) {
+      var gl = [];
+      for (var g1 = 0; g1 < n; g1++) if (goal[g1]) gl.push(g1);
+      var bestD = 1e18, bestN = -1;
+      for (var k1 = 0; k1 < n; k1++) {
+        if (dist[k1] > 1e17 || k1 === src) continue;
+        for (var h1 = 0; h1 < gl.length; h1++) {
+          var e1 = PX[k1]-PX[gl[h1]], e2 = PZ[k1]-PZ[gl[h1]], e3 = PY[k1]-PY[gl[h1]], d1 = e1*e1+e2*e2+e3*e3;
+          if (d1 < bestD) { bestD = d1; bestN = k1; }
+        }
+      }
+      if (bestN < 0) return null;
+      dst = bestN; search.approx = true;
+    }
+    var path = [dst];
+    while (path[path.length-1] !== src) path.push(prev[path[path.length-1]]);
+    path.reverse();
+    return path;
+  }
+
+  // ---- 8. way points ----
+  var wps = [], st = dec.start.p;
+  wps.push({ name: "start", x: st[0], y: st[1], z: st[2] });
+  var cps = [];
+  for (var pi2 = 0; pi2 < dec.parts.length; pi2++) {
+    var pp = dec.parts[pi2], ee = dec.lib[pp[3]];
+    if (pp[6] >= 0 && ee && ee.detector) cps.push(pp);
+  }
+  cps.sort(function (a, b) { return a[6] - b[6]; });
+  function centreOf(pp, ee) {
+    var cc = ee.detector.center, r = qrot([pp[8], pp[9], pp[10], pp[11]], cc[0], cc[1], cc[2]);
+    return { x: r[0] + pp[0]*5, y: r[1] + pp[1]*5, z: r[2] + pp[2]*5 };
+  }
+  var seenOrder = {};
+  for (var ci2 = 0; ci2 < cps.length; ci2++) {
+    if (seenOrder[cps[ci2][6]]) continue; seenOrder[cps[ci2][6]] = true;
+    var cc2 = centreOf(cps[ci2], dec.lib[cps[ci2][3]]);
+    wps.push({ name: "checkpoint " + (cps[ci2][6]+1), x: cc2.x, y: cc2.y, z: cc2.z, part: cps[ci2] });
+  }
+  var fin = null, finPart = null;
+  for (var pi3 = 0; pi3 < dec.parts.length; pi3++) {
+    var pf = dec.parts[pi3], ef = dec.lib[pf[3]];
+    if (ef && ef.detector && ef.detector.type === 1) { fin = centreOf(pf, ef); finPart = pf; break; }
+  }
+  if (!fin) return { ok: false, why: "no finish line found" };
+  wps.push({ name: "finish", x: fin.x, y: fin.y, z: fin.z, part: finPart });
+
+  function qinv(q) { return [-q[0], -q[1], -q[2], q[3]]; }
+  function gateGoal(pp, ee, fx, fy, fz) {
+    var det = ee.detector, cc = det.center, sz = det.size, qi = qinv([pp[8], pp[9], pp[10], pp[11]]);
+    var ox = pp[0]*5, oy = pp[1]*5, oz = pp[2]*5, flags = new Uint8Array(n), count = 0;
+    for (var i = 0; i < n; i++) {
+      if (blocked[i] || !cnt[i]) continue;
+      var l = qrot(qi, PX[i]-ox, PY[i]-oy, PZ[i]-oz);
+      if (Math.abs(l[0]-cc[0]) <= sz[0]/2 + 1.0 && Math.abs(l[1]-cc[1]) <= sz[1]/2 + 1.2 && Math.abs(l[2]-cc[2]) <= sz[2]/2 + 1.0) { flags[i] = 1; count++; }
+    }
+    if (!count) { var fb = nearestNode(fx, fy, fz, false); if (fb >= 0) { flags[fb] = 1; count = 1; } }
+    return { flags: flags, count: count };
+  }
+  var startNode = nearestNode(st[0], st[1] - 0.2, st[2], true);
+  if (startNode < 0) return { ok: false, why: "no road under the start" };
+  var gates = [];
+  for (var wi = 1; wi < wps.length; wi++) {
+    var gp = wps[wi].part, ge = dec.lib[gp[3]];
+    gates.push(gateGoal(gp, ge, wps[wi].x, wps[wi].y, wps[wi].z));
+    if (!gates[gates.length-1].count) return { ok: false, why: "no road near the " + wps[wi].name };
+  }
+  var path = [], src = startNode, reached = 0, partialWhy = null, jumpAt = [];
+  for (var wk = 0; wk < gates.length; wk++) {
+    var seg = search(src, gates[wk].flags);
+    if (!seg) { partialWhy = "no way from the " + wps[wk].name + " to the " + wps[wk+1].name; break; }
+    for (var sk = (path.length ? 1 : 0); sk < seg.length; sk++) { path.push(seg[sk]); }
+    if (search.approx) { partialWhy = "no way from the " + wps[wk].name + " to the " + wps[wk+1].name + " (drove as close as the road goes)"; break; }
+    src = seg[seg.length-1]; reached = wk + 1;
+  }
+  if (!reached && path.length < 5) return { ok: false, why: partialWhy || "no path" };
+
+  // ---- 9. resample in 3D, smooth along the surface, mark jumps ----
+  var pts = [], jumpEdge = [], jumps = 0;
+  for (var pk = 0; pk < path.length; pk++) {
+    var nd9 = path[pk];
+    pts.push([PX[nd9], PY[nd9], PZ[nd9], NX[nd9], NY[nd9], NZ[nd9]]);
+    var big = pk > 0 && Math.hypot(PX[nd9]-PX[path[pk-1]], PZ[nd9]-PZ[path[pk-1]], PY[nd9]-PY[path[pk-1]]) > 4.0;
+    jumpEdge.push(big); if (big) jumps++;
+  }
+  var segLen = [0];
+  for (var k3 = 1; k3 < pts.length; k3++) segLen.push(segLen[k3-1] + Math.hypot(pts[k3][0]-pts[k3-1][0], pts[k3][1]-pts[k3-1][1], pts[k3][2]-pts[k3-1][2]));
+  var total = segLen[segLen.length-1], m2 = Math.max(8, Math.round(total/SPACING)) + 1;
+  var out = [], isj = [], kk = 1;
+  for (var mi = 0; mi < m2; mi++) {
+    var sdist = total*mi/(m2-1);
+    while (kk < pts.length-1 && segLen[kk] < sdist) kk++;
+    var pa = pts[kk-1], pb = pts[kk], Ls = segLen[kk]-segLen[kk-1];
+    var tt = Ls < 1e-9 ? 0 : Math.min(1, Math.max(0, (sdist-segLen[kk-1])/Ls));
+    var nrm = [pa[3]+(pb[3]-pa[3])*tt, pa[4]+(pb[4]-pa[4])*tt, pa[5]+(pb[5]-pa[5])*tt], nl = Math.hypot(nrm[0], nrm[1], nrm[2]) || 1;
+    out.push([pa[0]+(pb[0]-pa[0])*tt, pa[1]+(pb[1]-pa[1])*tt, pa[2]+(pb[2]-pa[2])*tt, nrm[0]/nl, nrm[1]/nl, nrm[2]/nl]);
+    isj.push(jumpEdge[kk] && tt > 0 && tt < 1);
+  }
+  var pinned = [];
+  for (var mp = 0; mp < m2; mp++) pinned.push(isj[mp] || (mp > 0 && isj[mp-1]) || (mp < m2-1 && isj[mp+1]));
+  pinned[0] = true; pinned[m2-1] = true;
+  function snap(x, y, z, nrm, tol) {
+    var best = -1, bd = 1e18;
+    near(x, y, z, tol, function (j) {
+      if (blocked[j] || !cnt[j]) return;
+      if (NX[j]*nrm[0] + NY[j]*nrm[1] + NZ[j]*nrm[2] < 0.6) return;
+      var d2 = (PX[j]-x)*(PX[j]-x) + (PY[j]-y)*(PY[j]-y) + (PZ[j]-z)*(PZ[j]-z);
+      if (d2 < bd && d2 <= tol*tol) { bd = d2; best = j; }
+    });
+    return best;
+  }
+  for (var it = 0; it < 60; it++) {
+    for (var mq = 1; mq < m2-1; mq++) {
+      if (pinned[mq]) continue;
+      var P = out[mq];
+      var nxp = P[0] + 0.45*((out[mq-1][0]+out[mq+1][0])/2 - P[0]);
+      var nyp = P[1] + 0.45*((out[mq-1][1]+out[mq+1][1])/2 - P[1]);
+      var nzp = P[2] + 0.45*((out[mq-1][2]+out[mq+1][2])/2 - P[2]);
+      var jl = snap(nxp, nyp, nzp, P.slice(3), 1.6);
+      if (jl < 0 || clr[jl] < MINCLR) continue;
+      var okk = true, nb = [out[mq-1], out[mq+1]];
+      for (var bi = 0; bi < 2; bi++) {
+        var jm = snap((nxp+nb[bi][0])/2, (nyp+nb[bi][1])/2, (nzp+nb[bi][2])/2, P.slice(3), 2.2);
+        if (jm < 0 || clr[jm] < MINCLR*0.8) { okk = false; break; }
+      }
+      if (!okk) continue;
+      P[0] = nxp; P[1] = nyp; P[2] = nzp; P[3] = NX[jl]; P[4] = NY[jl]; P[5] = NZ[jl];
+    }
+  }
+  var mj = 0;
+  while (mj < m2) {
+    if (isj[mj]) {
+      var ja = mj; while (ja > 0 && isj[ja-1]) ja--;
+      var jb = mj; while (jb < m2-1 && isj[jb]) jb++;
+      var pA = out[Math.max(0, ja-1)], pB = out[Math.min(m2-1, jb)];
+      var Dtot = Math.hypot(pB[0]-pA[0], pB[2]-pA[2]) || 1;
+      var sl0 = ja >= 2 ? (out[ja-1][1]-out[ja-2][1])/Math.max(1e-6, Math.hypot(out[ja-1][0]-out[ja-2][0], out[ja-1][2]-out[ja-2][2])) : 0;
+      var endBal = pA[1] + sl0*Dtot - GRAV*Dtot*Dtot/(2*VH*VH);
+      for (var jj2 = ja; jj2 < jb; jj2++) {
+        var dd2 = Math.hypot(out[jj2][0]-pA[0], out[jj2][2]-pA[2]);
+        var bal = pA[1] + sl0*dd2 - GRAV*dd2*dd2/(2*VH*VH);
+        out[jj2][1] = bal + (pB[1]-endBal)*(dd2/Dtot);
+        out[jj2][3] = 0; out[jj2][4] = 1; out[jj2][5] = 0;
+      }
+      mj = jb;
+    }
+    mj++;
+  }
+  var route = [];
+  function r2(v) { return Math.round(v*100)/100; }
+  for (var ri = 0; ri < m2; ri++) route.push([r2(out[ri][0]), r2(out[ri][1]), r2(out[ri][2]), ri === 0 ? 5 : VMAX, r2(out[ri][3]), r2(out[ri][4]), r2(out[ri][5])]);
+  var res = { ok: true, partial: partialWhy, reachedGates: reached, route: route, jumpPoints: isj.filter(Boolean).length, jumps: jumps, nodes: n, ms: Date.now()-T0, lengthM: Math.round(total), waypoints: wps.map(function (w) { return { name: w.name, x: w.x, y: w.y, z: w.z }; }) };
+  if (opt.debug) res.debug = { n: n, PX: PX, PY: PY, PZ: PZ, NX: NX, NY: NY, NZ: NZ, blocked: blocked, nbr: nbr, cnt: cnt, NB: NB, nearestNode: nearestNode, clr: clr };
+  return res;
+}
+
 function generateRoute(dec, opt) {
   opt = opt || {};
   var CELL = 1.0, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.3, VMAX = opt.vmax || 250;
@@ -655,12 +1036,19 @@ const WORKER_HELPERS = `
     return best;
   }
 
+  // a route point is "flat" when it has no surface direction recorded (your lap) or the road there is close to level
+  function flatSeg(k) {
+    const a=ROUTE[Math.max(0,Math.min(N-1,k))], b=ROUTE[Math.max(0,Math.min(N-1,k+1))];
+    return a[5]===undefined || (a[5]>=0.8 && (b[5]===undefined || b[5]>=0.8));
+  }
+
   function lookAhead(p,ld,i) {
     let j=i;
     if(j<N-1) {
       const dx=ROUTE[j+1][0]-ROUTE[j][0];
+      const dy=flatSeg(j)?0:ROUTE[j+1][1]-ROUTE[j][1];
       const dz=ROUTE[j+1][2]-ROUTE[j][2];
-      if((p.x-ROUTE[j][0])*dx+(p.z-ROUTE[j][2])*dz>0) j++;
+      if((p.x-ROUTE[j][0])*dx+(p.y-ROUTE[j][1])*dy+(p.z-ROUTE[j][2])*dz>0) j++;
     }
 
     let ax=p.x, ay=p.y, az=p.z;
@@ -668,7 +1056,7 @@ const WORKER_HELPERS = `
 
     for(let k=j;k<N;k++) {
       const bx=ROUTE[k][0], by=ROUTE[k][1], bz=ROUTE[k][2];
-      const len=Math.hypot(bx-ax,bz-az);
+      const len=flatSeg(k-1)?Math.hypot(bx-ax,bz-az):Math.hypot(bx-ax,by-ay,bz-az);
       if(len>=remaining) {
         const f=remaining/Math.max(len,1e-9);
         return {x:ax+(bx-ax)*f,y:ay+(by-ay)*f,z:az+(bz-az)*f,index:k};
@@ -687,10 +1075,19 @@ const WORKER_HELPERS = `
       const ax=ROUTE[k][0], az=ROUTE[k][2];
       const bx=ROUTE[k+1][0], bz=ROUTE[k+1][2];
       const dx=bx-ax, dz=bz-az;
-      const l2=dx*dx+dz*dz || 1e-9;
-      let t=((p.x-ax)*dx+(p.z-az)*dz)/l2;
-      t=Math.max(0,Math.min(1,t));
-      const d=Math.hypot(p.x-(ax+dx*t),p.z-(az+dz*t));
+      let d;
+      if(flatSeg(k)) {
+        const l2=dx*dx+dz*dz || 1e-9;
+        let t=((p.x-ax)*dx+(p.z-az)*dz)/l2;
+        t=Math.max(0,Math.min(1,t));
+        d=Math.hypot(p.x-(ax+dx*t),p.z-(az+dz*t));
+      } else {
+        const ay=ROUTE[k][1], dy=ROUTE[k+1][1]-ay;
+        const l2=dx*dx+dy*dy+dz*dz || 1e-9;
+        let t=((p.x-ax)*dx+(p.y-ay)*dy+(p.z-az)*dz)/l2;
+        t=Math.max(0,Math.min(1,t));
+        d=Math.hypot(p.x-(ax+dx*t),p.y-(ay+dy*t),p.z-(az+dz*t));
+      }
       if(d<best) best=d;
     }
     return best===Infinity ? 0 : best;
@@ -705,8 +1102,17 @@ const WORKER_HELPERS = `
     for(let m=Math.max(1,k-2);m<=Math.min(N-2,k+2);m++) {
       const ax=ROUTE[m][0]-ROUTE[m-1][0], az=ROUTE[m][2]-ROUTE[m-1][2];
       const bx=ROUTE[m+1][0]-ROUTE[m][0], bz=ROUTE[m+1][2]-ROUTE[m][2];
-      const la=Math.hypot(ax,az), lb=Math.hypot(bx,bz);
-      const dh=Math.abs(Math.atan2(ax*bz-az*bx,ax*bx+az*bz));
+      let la=Math.hypot(ax,az), lb=Math.hypot(bx,bz);
+      let dh=Math.abs(Math.atan2(ax*bz-az*bx,ax*bx+az*bz));
+      if(ROUTE[m][5]!==undefined) {
+        // road with a surface direction: only turning along the surface slows the car (going up a loop or a bank does not)
+        const ay=ROUTE[m][1]-ROUTE[m-1][1], by=ROUTE[m+1][1]-ROUTE[m][1];
+        la=Math.hypot(ax,ay,az); lb=Math.hypot(bx,by,bz);
+        const ux=ax/(la||1),uy=ay/(la||1),uz=az/(la||1),vx=bx/(lb||1),vy=by/(lb||1),vz=bz/(lb||1);
+        const cx=uy*vz-uz*vy, cy=uz*vx-ux*vz, cz=ux*vy-uy*vx;
+        const turn=Math.abs(cx*ROUTE[m][4]+cy*ROUTE[m][5]+cz*ROUTE[m][6]);
+        dh=Math.atan2(turn,ux*vx+uy*vy+uz*vz);
+      }
       const curv=dh/Math.max((la+lb)/2,1e-6);
       if(curv>kmax) kmax=curv;
     }
@@ -726,8 +1132,18 @@ const WORKER_HELPERS = `
   }
   computeDerived();
 
-  function lateral(p,i) {
+  function lateral(p,i,u) {
     const k=Math.max(0,Math.min(N-2,i));
+    if(u && !flatSeg(k)) {
+      const ax=ROUTE[k][0], ay=ROUTE[k][1], az=ROUTE[k][2];
+      let dx=ROUTE[k+1][0]-ax, dy=ROUTE[k+1][1]-ay, dz=ROUTE[k+1][2]-az;
+      const l=Math.hypot(dx,dy,dz)||1e-9;
+      let t=((p.x-ax)*dx+(p.y-ay)*dy+(p.z-az)*dz)/(l*l);
+      t=Math.max(0,Math.min(1,t));
+      const ox=p.x-(ax+dx*t), oy=p.y-(ay+dy*t), oz=p.z-(az+dz*t);
+      dx/=l; dy/=l; dz/=l;
+      return -((dy*oz-dz*oy)*u.x+(dz*ox-dx*oz)*u.y+(dx*oy-dy*ox)*u.z);
+    }
     const ax=ROUTE[k][0], az=ROUTE[k][2], bx=ROUTE[k+1][0], bz=ROUTE[k+1][2];
     const dx=bx-ax, dz=bz-az;
     const l=Math.hypot(dx,dz)||1e-9;
@@ -1136,19 +1552,34 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       if(toff) {
         const k=Math.max(1,Math.min(N-1,target.index));
         const ddx=ROUTE[k][0]-ROUTE[k-1][0],ddz=ROUTE[k][2]-ROUTE[k-1][2];
-        const ll=Math.hypot(ddx,ddz)||1;
-        target={x:target.x+toff*(-ddz/ll),y:target.y,z:target.z+toff*(ddx/ll),index:target.index};
+        if(flatSeg(k-1)) {
+          const ll=Math.hypot(ddx,ddz)||1;
+          target={x:target.x+toff*(-ddz/ll),y:target.y,z:target.z+toff*(ddx/ll),index:target.index};
+        } else {
+          const ddy=ROUTE[k][1]-ROUTE[k-1][1], ll=Math.hypot(ddx,ddy,ddz)||1;
+          const dx1=ddx/ll,dy1=ddy/ll,dz1=ddz/ll,nx=ROUTE[k][4],ny=ROUTE[k][5],nz=ROUTE[k][6];
+          target={x:target.x+toff*(dy1*nz-dz1*ny),y:target.y+toff*(dz1*nx-dx1*nz),z:target.z+toff*(dx1*ny-dy1*nx),index:target.index};
+        }
       }
     }
 
     const f=rotateVec(state.quaternion,{x:0,y:0,z:FORWARD_SIGN});
+    // "up" for steering: the car's own up when it is on a steep bank, wall or loop, otherwise the world up (as before)
+    let upv={x:0,y:1,z:0};
+    if(state.wheels!==0) {
+      const cu=rotateVec(state.quaternion,{x:0,y:1,z:0});
+      if(cu.y<0.8) upv=cu;
+    }
     const dx=target.x-state.position.x;
+    const dy=target.y-state.position.y;
     const dz=target.z-state.position.z;
-    const fl=Math.hypot(f.x,f.z)||1;
-    const tl=Math.hypot(dx,dz)||1;
-    const fx=f.x/fl,fz=f.z/fl,tx=dx/tl,tz=dz/tl;
-    const cross=fz*tx-fx*tz;
-    const dot=Math.max(-1,Math.min(1,fx*tx+fz*tz));
+    const fu=f.x*upv.x+f.y*upv.y+f.z*upv.z, tu=dx*upv.x+dy*upv.y+dz*upv.z;
+    let fx=f.x-fu*upv.x, fy=f.y-fu*upv.y, fz=f.z-fu*upv.z;
+    let tx=dx-tu*upv.x, ty=dy-tu*upv.y, tz=dz-tu*upv.z;
+    const fl=Math.hypot(fx,fy,fz)||1, tl=Math.hypot(tx,ty,tz)||1;
+    fx/=fl; fy/=fl; fz/=fl; tx/=tl; ty/=tl; tz/=tl;
+    const cross=(fy*tz-fz*ty)*upv.x+(fz*tx-fx*tz)*upv.y+(fx*ty-fy*tx)*upv.z;
+    const dot=Math.max(-1,Math.min(1,fx*tx+fy*ty+fz*tz));
     const angle=Math.atan2(cross,dot);
     const abs=Math.abs(angle);
 
@@ -1159,7 +1590,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     else if(speed>tSpeed) up=false;
     if(abs>1.0 && speed>60) up=false;
 
-    const lat=lateral(state.position,i)-(LEARN ? offAt(i) : 0);
+    const lat=lateral(state.position,i,upv)-(LEARN ? offAt(i) : 0);
 
     // Detect landing, then briefly soften heading correction to reduce sharp swerves.
     const airborneNow=state.wheels===0;
@@ -1376,6 +1807,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
   }
 
   ${generateRoute.toString()}
+  ${generateRoute3D.toString()}
+  const USE_3D = ${USE_3D};
 
   // ---- ROUTE SWITCHING ----
   const PER_CAR=["idx","acc","stuck","lastPos","lastFrames","hist","lastCrash","lastOff","lastCp","airSince","airV0",
@@ -1433,7 +1866,19 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
           console.log("PTBOT_ROUTE using your recorded lap for this track");
           applyRoute(ROUTE_REC,null,"recorded");
         } else {
-          try { gen=generateRoute({parts:parts,lib:TRACK_LIB,start:start}); } catch(err) { gen={ok:false,why:"error: "+String(err)}; }
+          const decIn={parts:parts,lib:TRACK_LIB,start:start};
+          let gen3=null;
+          if(USE_3D) {
+            try { gen3=generateRoute3D(decIn); } catch(err) { gen3={ok:false,why:"error: "+String(err)}; }
+            if(gen3 && gen3.ok) console.log("PTBOT_ROUTE 3D builder: "+gen3.route.length+" points, "+gen3.lengthM+" m, "+gen3.ms+" ms"+(gen3.partial?" (partial: "+gen3.partial+")":""));
+            else console.log("PTBOT_ROUTE 3D builder failed: "+(gen3?gen3.why:"?"));
+          }
+          if(gen3 && gen3.ok && !gen3.partial) gen=gen3;
+          else {
+            let gen2=null;
+            try { gen2=generateRoute(decIn); } catch(err) { gen2={ok:false,why:"error: "+String(err)}; }
+            if(gen3 && gen3.ok && (!gen2 || !gen2.ok || (gen2.reachedGates||0)<=(gen3.reachedGates||0))) gen=gen3; else gen=gen2;
+          }
           if(gen && gen.ok) {
             console.log("PTBOT_ROUTE built a line from the track: "+gen.route.length+" points, "+gen.lengthM+" m, "+gen.jumps+" jump(s), "+gen.ms+" ms");
             applyRoute(gen.route,tid,"generated");
@@ -1702,7 +2147,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.7.5";
+    this.modVersion="0.7.6";
     this.touchingPhysics=true;
   }
 
