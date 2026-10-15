@@ -1,3 +1,4 @@
+
 import { PolyMod, MixinType } from "https://cdn.polymodloader.com/cb/PolyTrackMods/PolyModLoader/0.6.3/PolyTypes.js";
 
 // "drive" = the bot drives the recorded lap.
@@ -182,7 +183,7 @@ const ROUTE = [
 // dec = { parts:[[x,y,z,id,rot,axis,cpo,so,qx,qy,qz,qw],...], lib:{id:{v:[...],detector,startOffset}}, start:{p:[x,y,z]} }
 function generateRoute3D(dec, opt) {
   opt = opt || {};
-  var S = opt.step || 1.3, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.0, VMAX = opt.vmax || 250;
+  var S = opt.step || 1.3, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.0, VMAX = opt.vmax || 400;
   var GRAV = 16.0, VHS = [12, 35, 55, 75], VH = 55.0;
   var NB = 16, RAD = S*1.7, T0 = Date.now();
 
@@ -562,7 +563,7 @@ function generateRoute3D(dec, opt) {
 
 function generateRoute(dec, opt) {
   opt = opt || {};
-  var CELL = 1.0, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.3, VMAX = opt.vmax || 250;
+  var CELL = 1.0, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.3, VMAX = opt.vmax || 400;
   var GRAV = 16.0, VH = 55.0, VHS = [12, 35, 55, 75];
   var t0 = Date.now();
 
@@ -1935,7 +1936,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     for(const a of s) {
       const air=(a[9]===0);
       const u=air ? {x:0,y:1,z:0} : rotateVec({x:a[4],y:a[5],z:a[6],w:a[7]},{x:0,y:1,z:0});
-      pts.push([a[1],a[2],a[3],Math.max(20,Math.min(300,a[8]*LESSON_SPEED)),u.x,u.y,u.z,a[10]|0]);
+      pts.push([a[1],a[2],a[3],Math.max(20,Math.min(420,a[8]*LESSON_SPEED)),u.x,u.y,u.z,a[10]|0]);
     }
     const out=[pts[0]]; const oi=[0]; let acc=0;
     for(let i=1;i<pts.length;i++) {
@@ -2415,7 +2416,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.8.6";
+    this.modVersion="0.8.7";
     this.touchingPhysics=true;
   }
 
