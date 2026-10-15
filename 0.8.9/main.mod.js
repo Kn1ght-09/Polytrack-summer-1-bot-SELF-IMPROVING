@@ -1449,6 +1449,13 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     return Math.atan2(ROUTE[k][1]-ROUTE[k-1][1],dh);
   }
 
+  // The recorded/learned lap speed is not an engine top-speed limit.
+  // Keep it available for learning and diagnostics, but do not cap throttle
+  // to the speed you happened to reach during the recording. Only actual
+  // cornering/grip estimates and explicitly configured slow zones may ask us
+  // to lift or brake. This prevents the 303-306 km/h speed-hunting on straights.
+  const IGNORE_RECORDED_SPEED_CAP = true;
+
   function targetSpeed(i,Aest) {
     let best=Infinity;
     const hi=Math.min(N-1,i+25);
@@ -1459,7 +1466,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       let zc=1000;
       for(const z of SLOW_ZONES) { if(j>=z[0] && j<=z[1] && z[2]<zc) zc=z[2]; }
       const capG=(Aest>0 && KAP[j]>1e-4) ? 3.6*Math.sqrt(C2_GRIP_FRAC*Aest/KAP[j]) : 1000;
-      const v=Math.min(SPD[j]*SPEED_FACTOR*Pj.sp*(1+spdAt(j)),CAP[j],zc,capG)+Pi.br*(j-i);
+      const routeCap=IGNORE_RECORDED_SPEED_CAP ? 1000 : SPD[j]*SPEED_FACTOR*Pj.sp*(1+spdAt(j));
+      const v=Math.min(routeCap,CAP[j],zc,capG)+Pi.br*(j-i);
       if(v<best) best=v;
     }
     return Math.max(best,25);
@@ -2424,7 +2432,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.8.8";
+    this.modVersion="0.8.9";
     this.touchingPhysics=true;
   }
 
