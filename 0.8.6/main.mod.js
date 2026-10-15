@@ -42,6 +42,8 @@ const THR_BIG = 15;   // km/h over: acts immediately
 const LIFT_MS = 80;  // too fast for this long (ms) before lifting
 const BRAKE_MS = 40;  // too fast for this long (ms) before braking
 const CURV_DEAD = 0.04; // tiny wobbles in the line (under this many radians per point) don't count as a corner, so the bot stops slowing down in straight corridors
+const REPLAY = true;   // on ramps, walls and slopes that you taught, the bot presses what YOU pressed there (kept in step with where the car is)
+const REPLAY_FIX = 0.25; // how much the bot's own steering is mixed in to keep it on the line during a replay
 const FAR_W = 0;         // early aim: how much the bot leans toward where the line goes further ahead (0 = off)
 const FAR_SEC = 0.9;     // how many seconds ahead the early aim looks
 const C2_GRIP_FRAC = 1.2;  // corners are taken at no more than this fraction of the sideways grip the bot has measured
@@ -969,6 +971,7 @@ const WORKER_HELPERS = `
   const STEER_GAIN = ${STEER_GAIN};
   const LAT_ACCEL = ${LAT_ACCEL};
   const CURV_DEAD = ${CURV_DEAD};
+  const REPLAY = ${REPLAY}, REPLAY_FIX = ${REPLAY_FIX};
   const LINE_PULL = ${LINE_PULL};
   const LOW_SPEED_BOOST = ${LOW_SPEED_BOOST};
   const SLOW_ZONES_REC = ${JSON.stringify(SLOW_ZONES)};
@@ -1113,9 +1116,10 @@ const WORKER_HELPERS = `
   let CAP=[];
   let KAP=[];
   let SKAP=[];
+  let HARD=[];
   let SPD=[];
   function computeDerived() {
-  CAP=[]; KAP=[]; SKAP=[];
+  CAP=[]; KAP=[]; SKAP=[]; HARD=[];
   for(let k=0;k<N;k++) {
     let kmax=0;
     for(let m=Math.max(1,k-2);m<=Math.min(N-2,k+2);m++) {
@@ -1137,6 +1141,7 @@ const WORKER_HELPERS = `
       if(curv>kmax) kmax=curv;
     }
     KAP.push(kmax);
+    { let h=false; for(let j=Math.max(0,k-1);j<=Math.min(N-2,k+3);j++) { if(ROUTE[j][8]!==undefined && (ROUTE[j][5]<0.93 || Math.abs(ROUTE[j+1][1]-ROUTE[j][1])>1.0)) h=true; } HARD.push(h); }
     {
       // signed bend at this point (positive = bending toward the side where angle is positive)
       const m=Math.max(1,Math.min(N-2,k));
@@ -1720,6 +1725,13 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       ));
     }
 
+    if(REPLAY && HARD[i] && ROUTE[i][8]!==undefined && Math.abs(lat)<2.2 && abs<1.0) {
+      const sc=Math.max(-0.35,Math.min(0.35,REPLAY_FIX*s));
+      s=Math.max(-1,Math.min(1,ROUTE[i][8]+sc));
+      up=ROUTE[i][9]===1; down=ROUTE[i][9]===2;
+      bot.replaying=true;
+    } else bot.replaying=false;
+
     let e=(bot.acc[id]??0)+s;
     let right=false,left=false;
     if(e>=1) { right=true;e-=1; }
@@ -1923,14 +1935,22 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     for(const a of s) {
       const air=(a[9]===0);
       const u=air ? {x:0,y:1,z:0} : rotateVec({x:a[4],y:a[5],z:a[6],w:a[7]},{x:0,y:1,z:0});
-      pts.push([a[1],a[2],a[3],Math.max(20,Math.min(300,a[8]*LESSON_SPEED)),u.x,u.y,u.z]);
+      pts.push([a[1],a[2],a[3],Math.max(20,Math.min(300,a[8]*LESSON_SPEED)),u.x,u.y,u.z,a[10]|0]);
     }
-    const out=[pts[0]]; let acc=0;
+    const out=[pts[0]]; const oi=[0]; let acc=0;
     for(let i=1;i<pts.length;i++) {
       acc+=Math.hypot(pts[i][0]-pts[i-1][0],pts[i][1]-pts[i-1][1],pts[i][2]-pts[i-1][2]);
-      if(acc>=5 || i===pts.length-1) { out.push(pts[i]); acc=0; }
+      if(acc>=5 || i===pts.length-1) { out.push(pts[i]); oi.push(i); acc=0; }
     }
-    return out.map(p=>[+p[0].toFixed(2),+p[1].toFixed(2),+p[2].toFixed(2),Math.round(p[3]),+p[4].toFixed(2),+p[5].toFixed(2),+p[6].toFixed(2),1]);
+    // what you pressed between this point and the next: steering (-1 left .. +1 right) and gas/brake (1 gas, 2 brake, 0 coast)
+    return out.map((p,k)=>{
+      const lo=oi[k], hi=k+1<oi.length ? oi[k+1] : lo+1;
+      let R=0,Lf=0,U=0,D=0,n=0;
+      for(let m=lo;m<Math.max(hi,lo+1) && m<pts.length;m++) { const c=pts[m][7]; n++; if(c&2)R++; if(c&8)Lf++; if(c&1)U++; if(c&4)D++; }
+      n=n||1;
+      const ud = D/n>0.3 ? 2 : (U/n>0.5 ? 1 : 0);
+      return [+p[0].toFixed(2),+p[1].toFixed(2),+p[2].toFixed(2),Math.round(p[3]),+p[4].toFixed(2),+p[5].toFixed(2),+p[6].toFixed(2),1,+((R-Lf)/n).toFixed(2),ud];
+    });
   }
   // Finds where the patch joins the bot's line. Only the part of your drive that is near the line is used,
   // so it does not matter if you started or stopped away from it.
@@ -2395,7 +2415,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.8.5";
+    this.modVersion="0.8.6";
     this.touchingPhysics=true;
   }
 
