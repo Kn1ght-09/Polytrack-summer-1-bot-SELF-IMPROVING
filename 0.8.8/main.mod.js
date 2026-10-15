@@ -1,4 +1,3 @@
-
 import { PolyMod, MixinType } from "https://cdn.polymodloader.com/cb/PolyTrackMods/PolyModLoader/0.6.3/PolyTypes.js";
 
 // "drive" = the bot drives the recorded lap.
@@ -563,7 +562,7 @@ function generateRoute3D(dec, opt) {
 
 function generateRoute(dec, opt) {
   opt = opt || {};
-  var CELL = 1.0, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.3, VMAX = opt.vmax || 400;
+  var CELL = opt.cell || 1.0, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.3, VMAX = opt.vmax || 400;
   var GRAV = 16.0, VH = 55.0, VHS = [12, 35, 55, 75];
   var t0 = Date.now();
 
@@ -2113,14 +2112,23 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
           const decIn={parts:parts,lib:TRACK_LIB,start:start};
           let gen3=null;
           if(USE_3D) {
-            try { gen3=generateRoute3D(decIn); } catch(err) { gen3={ok:false,why:"error: "+String(err)}; }
+            // long tracks: if the track is too big for the fine grid, try coarser grids until it fits
+            for(const st of [0,1.8,2.5,3.5,5]) {
+              try { gen3=generateRoute3D(decIn, st ? {step:st} : undefined); } catch(err) { gen3={ok:false,why:"error: "+String(err)}; }
+              if(gen3 && gen3.ok) { if(st) console.log("PTBOT_ROUTE long track: used a coarser grid ("+st+" m)"); break; }
+              if(!gen3 || !/too large/.test(gen3.why||"")) break;
+            }
             if(gen3 && gen3.ok) console.log("PTBOT_ROUTE 3D builder: "+gen3.route.length+" points, "+gen3.lengthM+" m, "+gen3.ms+" ms"+(gen3.partial?" (partial: "+gen3.partial+")":""));
             else console.log("PTBOT_ROUTE 3D builder failed: "+(gen3?gen3.why:"?"));
           }
           if(gen3 && gen3.ok && !gen3.partial) gen=gen3;
           else {
             let gen2=null;
-            try { gen2=generateRoute(decIn); } catch(err) { gen2={ok:false,why:"error: "+String(err)}; }
+            for(const cl of [0,1.6,2.4,3.5]) {
+              try { gen2=generateRoute(decIn, cl ? {cell:cl} : undefined); } catch(err) { gen2={ok:false,why:"error: "+String(err)}; }
+              if(gen2 && gen2.ok) break;
+              if(!gen2 || !/too large/.test(gen2.why||"")) break;
+            }
             if(gen3 && gen3.ok && (!gen2 || !gen2.ok || (gen2.reachedGates||0)<=(gen3.reachedGates||0))) gen=gen3; else gen=gen2;
           }
           if(gen && gen.ok) {
@@ -2416,7 +2424,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.8.7";
+    this.modVersion="0.8.8";
     this.touchingPhysics=true;
   }
 
