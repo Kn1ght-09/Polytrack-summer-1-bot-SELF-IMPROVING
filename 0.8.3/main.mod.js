@@ -30,6 +30,16 @@ const SPEED_VALUE = 0.8;
 const MAX_LINE_SHIFT = 6;
 const MAX_SPEED_SHIFT = 0.2;
 const EXPLORE_RUNS = 60;
+// ---- STEERING v2: the bot measures how fast its car really turns and steers by yaw rate (with damping) ----
+const CTRL2 = true;        // false = the old steering everywhere
+const C2_KW = 1.0;         // damping: how hard it fights a turn rate that is too fast or too slow
+const C2_G0 = 0.8;         // first guess of the car's full-steer turn rate (rad/s); it learns the real value while driving
+const C2_FF = 0;           // steering preview: how much of the bend ahead the bot starts turning for early (0 = none)
+const SMOOTH_SHIFT = 0.8; // the line is straightened out by up to this many metres so turns start earlier and gentler (0 = off)
+const FAR_W = 0;         // early aim: how much the bot leans toward where the line goes further ahead (0 = off)
+const FAR_SEC = 0.9;     // how many seconds ahead the early aim looks
+const C2_GRIP_FRAC = 1.2;  // corners are taken at no more than this fraction of the sideways grip the bot has measured
+const LESSON_SPEED = 1.03; // taught sections: the bot aims for this fraction of YOUR speed (1.0 = same as you, 1.05 = 5% faster)
 const DOWNLOAD_DRIVE = false; // true = also save a ptbot_drive.json file every time you stop recording
 const USE_3D = true; // build lines on the road surface itself (ramps, banks, walls, loops); false = old flat-road builder
 const REC_KEY = "o"; // press once to start recording YOUR driving (bot steps aside), press again to stop and save
@@ -41,14 +51,14 @@ const RESTART_KEY = { key: "t", code: "KeyT", keyCode: 84 };
 
 // ---- DRIVING SETTINGS ----
 const SPEED_FACTOR = 1.0;
-const STEER_GAIN = 2.8;
+const STEER_GAIN = 3.5;
 const LAT_ACCEL = 40;
 const SLOW_ZONES = [[5, 17, 95]];
 const LOW_SPEED_BOOST = 2;
-const LINE_PULL = 0.08;
-const LOOK_BASE = 10;
-const LOOK_SPEED = 0.18;
-const LOOK_MAX = 48;
+const LINE_PULL = 0.03;
+const LOOK_BASE = 6;
+const LOOK_SPEED = 0.09;
+const LOOK_MAX = 34;
 const DECODE_OFFSET = 4;
 const STEER_SIGN = -1;
 const FORWARD_SIGN = 1;
@@ -1094,9 +1104,11 @@ const WORKER_HELPERS = `
   }
 
   let CAP=[];
+  let KAP=[];
+  let SKAP=[];
   let SPD=[];
   function computeDerived() {
-  CAP=[];
+  CAP=[]; KAP=[]; SKAP=[];
   for(let k=0;k<N;k++) {
     let kmax=0;
     for(let m=Math.max(1,k-2);m<=Math.min(N-2,k+2);m++) {
@@ -1115,6 +1127,19 @@ const WORKER_HELPERS = `
       }
       const curv=dh/Math.max((la+lb)/2,1e-6);
       if(curv>kmax) kmax=curv;
+    }
+    KAP.push(kmax);
+    {
+      // signed bend at this point (positive = bending toward the side where angle is positive)
+      const m=Math.max(1,Math.min(N-2,k));
+      const ax=ROUTE[m][0]-ROUTE[m-1][0], ay=ROUTE[m][1]-ROUTE[m-1][1], az=ROUTE[m][2]-ROUTE[m-1][2];
+      const bx=ROUTE[m+1][0]-ROUTE[m][0], by=ROUTE[m+1][1]-ROUTE[m][1], bz=ROUTE[m+1][2]-ROUTE[m][2];
+      const nx=ROUTE[m][4]===undefined?0:ROUTE[m][4], ny=ROUTE[m][5]===undefined?1:ROUTE[m][5], nz=ROUTE[m][6]===undefined?0:ROUTE[m][6];
+      const la=Math.hypot(ax,ay,az)||1, lb=Math.hypot(bx,by,bz)||1;
+      const cx=(ay*bz-az*by), cy=(az*bx-ax*bz), cz=(ax*by-ay*bx);
+      const sn=(cx*nx+cy*ny+cz*nz)/(la*lb);
+      const dotp=(ax*bx+ay*by+az*bz)/(la*lb);
+      SKAP.push(Math.atan2(sn,dotp)/((la+lb)/2));
     }
     CAP.push(kmax>1e-6 ? Math.sqrt(LAT_ACCEL/kmax)*3.6 : 1000);
   }
@@ -1411,7 +1436,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     return Math.atan2(ROUTE[k][1]-ROUTE[k-1][1],dh);
   }
 
-  function targetSpeed(i) {
+  function targetSpeed(i,Aest) {
     let best=Infinity;
     const hi=Math.min(N-1,i+25);
     const Pi=paramsAt(i);
@@ -1420,7 +1445,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       const Pj=paramsAt(j);
       let zc=1000;
       for(const z of SLOW_ZONES) { if(j>=z[0] && j<=z[1] && z[2]<zc) zc=z[2]; }
-      const v=Math.min(SPD[j]*SPEED_FACTOR*Pj.sp*(1+spdAt(j)),CAP[j],zc)+Pi.br*(j-i);
+      const capG=(Aest>0 && KAP[j]>1e-4) ? 3.6*Math.sqrt(C2_GRIP_FRAC*Aest/KAP[j]) : 1000;
+      const v=Math.min(SPD[j]*SPEED_FACTOR*Pj.sp*(1+spdAt(j)),CAP[j],zc,capG)+Pi.br*(j-i);
       if(v<best) best=v;
     }
     return Math.max(best,25);
@@ -1498,6 +1524,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       bot.airV0[id]=undefined;
       bot.lastPitch[id]=undefined;
       bot.airMatched[id]=false;
+      bot.c2[id]=undefined;
       if(LEARN && lf!==undefined) startRun();
     }
     bot.lastFrames[id]=state.frames;
@@ -1547,97 +1574,58 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       bot.lastCp[id]=state.nextCheckpointIndex;
     }
 
-const tight = ROUTE[i][7] === 1 || ROUTE[Math.min(N - 1, i + 2)][7] === 1;
-let ld = Math.max(LOOK_BASE, Math.min(LOOK_MAX, LOOK_BASE + speed * LOOK_SPEED + (tight ? 12 : 0)));
-if (tight) ld += 10;
-let target = lookAhead(state.position, ld, i);
-
-if (LEARN) {
-  const toff = offAt(target.index);
-  if (toff) {
-    const k = Math.max(1, Math.min(N - 1, target.index));
-    const ddx = ROUTE[k][0] - ROUTE[k - 1][0];
-    const ddz = ROUTE[k][2] - ROUTE[k - 1][2];
-    if (flatSeg(k - 1)) {
-      const ll = Math.hypot(ddx, ddz) || 1;
-      target = {
-        x: target.x + toff * (-ddz / ll),
-        y: target.y,
-        z: target.z + toff * (ddx / ll),
-        index: target.index
-      };
-    } else {
-      const ddy = ROUTE[k][1] - ROUTE[k - 1][1];
-      const ll = Math.hypot(ddx, ddy, ddz) || 1;
-      const dx1 = ddx / ll, dy1 = ddy / ll, dz1 = ddz / ll;
-      const nx = ROUTE[k][4], ny = ROUTE[k][5], nz = ROUTE[k][6];
-      target = {
-        x: target.x + toff * (dy1 * nz - dz1 * ny),
-        y: target.y + toff * (dz1 * nx - dx1 * nz),
-        z: target.z + toff * (dx1 * ny - dy1 * nx),
-        index: target.index
-      };
+    const tight=ROUTE[i][7]===1 || ROUTE[Math.min(N-1,i+2)][7]===1;
+    let ld=Math.max(LOOK_BASE,Math.min(LOOK_MAX,LOOK_BASE+speed*LOOK_SPEED));
+    if(tight) ld*=0.75;
+    let target=lookAhead(state.position,ld,i);
+    if(LEARN) {
+      const toff=offAt(target.index);
+      if(toff) {
+        const k=Math.max(1,Math.min(N-1,target.index));
+        const ddx=ROUTE[k][0]-ROUTE[k-1][0],ddz=ROUTE[k][2]-ROUTE[k-1][2];
+        if(flatSeg(k-1)) {
+          const ll=Math.hypot(ddx,ddz)||1;
+          target={x:target.x+toff*(-ddz/ll),y:target.y,z:target.z+toff*(ddx/ll),index:target.index};
+        } else {
+          const ddy=ROUTE[k][1]-ROUTE[k-1][1], ll=Math.hypot(ddx,ddy,ddz)||1;
+          const dx1=ddx/ll,dy1=ddy/ll,dz1=ddz/ll,nx=ROUTE[k][4],ny=ROUTE[k][5],nz=ROUTE[k][6];
+          target={x:target.x+toff*(dy1*nz-dz1*ny),y:target.y+toff*(dz1*nx-dx1*nz),z:target.z+toff*(dx1*ny-dy1*nx),index:target.index};
+        }
+      }
     }
-  }
-}
 
-const f = rotateVec(state.quaternion, { x: 0, y: 0, z: FORWARD_SIGN });
+    const f=rotateVec(state.quaternion,{x:0,y:0,z:FORWARD_SIGN});
+    // "up" for steering: the car's own up when it is on a steep bank, wall or loop, otherwise the world up (as before)
+    let upv={x:0,y:1,z:0};
+    if(state.wheels!==0) {
+      const cu=rotateVec(state.quaternion,{x:0,y:1,z:0});
+      if(cu.y<0.8) upv=cu;
+    }
+    const dx=target.x-state.position.x;
+    const dy=target.y-state.position.y;
+    const dz=target.z-state.position.z;
+    const fu=f.x*upv.x+f.y*upv.y+f.z*upv.z, tu=dx*upv.x+dy*upv.y+dz*upv.z;
+    let fx=f.x-fu*upv.x, fy=f.y-fu*upv.y, fz=f.z-fu*upv.z;
+    let tx=dx-tu*upv.x, ty=dy-tu*upv.y, tz=dz-tu*upv.z;
+    const fl=Math.hypot(fx,fy,fz)||1, tl=Math.hypot(tx,ty,tz)||1;
+    fx/=fl; fy/=fl; fz/=fl; tx/=tl; ty/=tl; tz/=tl;
+    const cross=(fy*tz-fz*ty)*upv.x+(fz*tx-fx*tz)*upv.y+(fx*ty-fy*tx)*upv.z;
+    const dot=Math.max(-1,Math.min(1,fx*tx+fy*ty+fz*tz));
+    const angle=Math.atan2(cross,dot);
+    const abs=Math.abs(angle);
 
-// "up" for steering: the car's own up when it is on a steep bank, wall or loop, otherwise the world up
-let upv = { x: 0, y: 1, z: 0 };
-if (state.wheels !== 0) {
-  const cu = rotateVec(state.quaternion, { x: 0, y: 1, z: 0 });
-  if (cu.y < 0.8) upv = cu;
-}
+    const useC2=CTRL2 && bot.routeKind!=="recorded";
+    let tSpeed=targetSpeed(i,(useC2 && bot.c2[id]) ? Math.max(0.6*LAT_ACCEL,bot.c2[id].A) : 0);
+    if(state.frames<(bot.keepUntil[id]||0) && bot.keepSpeed[id]>tSpeed) tSpeed=bot.keepSpeed[id];
+    let up=true,down=false;
+    if(speed>tSpeed+8 && speed>40) { up=false;down=true; }
+    else if(speed>tSpeed) up=false;
+    // standing start: full throttle (the slow first route points used to hold the car back to about 25 km/h)
+    if(i<8 && speed<60 && state.wheels!==0) { up=true; down=false; }
+    if(abs>1.0 && speed>60) up=false;
 
-const dx = target.x - state.position.x;
-const dy = target.y - state.position.y;
-const dz = target.z - state.position.z;
-const fu = f.x * upv.x + f.y * upv.y + f.z * upv.z;
-const tu = dx * upv.x + dy * upv.y + dz * upv.z;
-let fx = f.x - fu * upv.x, fy = f.y - fu * upv.y, fz = f.z - fu * upv.z;
-let tx = dx - tu * upv.x, ty = dy - tu * upv.y, tz = dz - tu * upv.z;
-const fl = Math.hypot(fx, fy, fz) || 1;
-const tl = Math.hypot(tx, ty, tz) || 1;
-fx /= fl; fy /= fl; fz /= fl;
-tx /= tl; ty /= tl; tz /= tl;
+    const lat=lateral(state.position,i,upv)-(LEARN ? offAt(i) : 0);
 
-const cross = (fy * tz - fz * ty) * upv.x +
-             (fz * tx - fx * tz) * upv.y +
-             (fx * ty - fy * tx) * upv.z;
-const dot = Math.max(-1, Math.min(1, fx * tx + fy * ty + fz * tz));
-const angle = Math.atan2(cross, dot);
-const abs = Math.abs(angle);
-
-let tSpeed = targetSpeed(i);
-if (state.frames < (bot.keepUntil[id] || 0) && bot.keepSpeed[id] > tSpeed) tSpeed = bot.keepSpeed[id];
-
-let up = true, down = false;
-if (speed > tSpeed + 8 && speed > 40) { up = false; down = true; }
-else if (speed > tSpeed) up = false;
-if (abs > 1.0 && speed > 60) up = false;
-
-const lat = lateral(state.position, i, upv) - (LEARN ? offAt(i) : 0);
-
-// more early correction before it gets too late
-const lineAssist = Math.max(-8, Math.min(8, lat)) * (tight ? 2.4 : 1.8);
-const steerAngle = angle * (landing ? 0.7 : 1) + LINE_PULL * lineAssist;
-
-// smooth steering instead of left/right stepping
-let desired = steerAngle * STEER_GAIN *
-  (1 + LOW_SPEED_BOOST * Math.max(0, 1 - speed / 150)) * STEER_SIGN;
-desired = Math.max(-1, Math.min(1, desired));
-
-const current = bot.acc[id] ?? 0;
-const step = Math.abs(desired - current) > 0.5 ? 0.24 : 0.12;
-let s = current + Math.max(-step, Math.min(step, desired - current));
-if (Math.abs(s) < 0.04) s = 0;
-s = Math.max(-1, Math.min(1, s));
-bot.acc[id] = s;
-
-let right = false, left = false;
-if (s > 0.18) right = true;
-else if (s < -0.18) left = true;
     // Detect landing, then briefly soften heading correction to reduce sharp swerves.
     const airborneNow=state.wheels===0;
     const wasAirborne=bot.lastAirborne[id]===true;
@@ -1653,13 +1641,62 @@ else if (s < -0.18) left = true;
 
     const landing=state.frames<(bot.landSteerUntil[id]||0);
     const headingScale=landing ? 0.65 : 1;
-    const steerAngle=angle*headingScale+
+    let farTerm=0;
+    if(FAR_W>0 && CTRL2 && bot.routeKind!=="recorded" && !landing && Math.abs(lat)<1.3 && speed>60) {
+      const ldF=Math.max(14,Math.min(60,speed/3.6*FAR_SEC));
+      const tf=lookAhead(state.position,ldF,i);
+      const ex=tf.x-state.position.x, ey=tf.y-state.position.y, ez=tf.z-state.position.z;
+      const eu=ex*upv.x+ey*upv.y+ez*upv.z;
+      let gx=ex-eu*upv.x, gy=ey-eu*upv.y, gz=ez-eu*upv.z;
+      const gl=Math.hypot(gx,gy,gz)||1; gx/=gl; gy/=gl; gz/=gl;
+      const cr=(fy*gz-fz*gy)*upv.x+(fz*gx-fx*gz)*upv.y+(fx*gy-fy*gx)*upv.z;
+      const dt2=Math.max(-1,Math.min(1,fx*gx+fy*gy+fz*gz));
+      const fa=Math.atan2(cr,dt2);
+      farTerm=Math.max(-0.5,Math.min(0.5,FAR_W*(fa-angle)));
+    }
+    const steerAngle=angle*headingScale+farTerm+
       (tight?2:1)*LINE_PULL*Math.max(-8,Math.min(8,lat));
 
-    const s=Math.max(-1,Math.min(1,
-      steerAngle*STEER_GAIN*
-      (1+LOW_SPEED_BOOST*Math.max(0,1-speed/150))*STEER_SIGN
-    ));
+    let s;
+    if(useC2) {
+      // measure the turn rate (positive = turning toward the side where angle is positive)
+      let c2=bot.c2[id];
+      if(!c2) c2=bot.c2[id]={pf:null,pfr:state.frames,om:0,cf:0,cp:0,Sw:20*C2_G0,Su:20,G:C2_G0,A:LAT_ACCEL};
+      const dtf=Math.max(1,state.frames-c2.pfr), dts=dtf/1000;
+      const fresh=state.frames>c2.pfr;
+      if(fresh && c2.pf) {
+        const px=c2.pf.x,py=c2.pf.y,pz=c2.pf.z;
+        const cx=(py*fz-pz*fy)*upv.x+(pz*fx-px*fz)*upv.y+(px*fy-py*fx)*upv.z;
+        const dd=px*fx+py*fy+pz*fz;
+        const omRaw=Math.atan2(cx,dd)/dts;
+        c2.om+=(omRaw-c2.om)*Math.min(1,dts/0.02);
+      }
+      if(fresh || !c2.pf) { c2.pf={x:fx,y:fy,z:fz}; c2.pfr=state.frames; }
+      // where the steering has got to, given the car's steering lag, then learn the real turn rate from it
+      if(fresh) c2.cf+=(c2.cp-c2.cf)*Math.min(1,dts/0.107);
+      if(fresh && speed>40 && state.wheels!==0 && Math.abs(c2.cf)>0.15) {
+        const lam=Math.pow(0.9995,dtf);
+        c2.Sw=lam*c2.Sw+c2.om*c2.cf; c2.Su=lam*c2.Su+c2.cf*c2.cf;
+        c2.G=Math.max(0.3,Math.min(3,c2.Sw/c2.Su));
+        if(speed>110) c2.A+=(Math.max(20,Math.min(90,c2.G*speed/3.6))-c2.A)*Math.min(1,dts/3);
+      }
+      const vms=Math.max(2,speed/3.6);
+      let omDes=2*vms/Math.max(ld,4)*Math.sin(Math.max(-1.4,Math.min(1.4,steerAngle)));
+      if(C2_FF>0) {
+        // preview: the bend about a quarter of a second ahead
+        const jf=Math.min(N-2,i+Math.max(1,Math.round(vms*0.25/5.5)));
+        omDes+=C2_FF*vms*SKAP[jf];
+      }
+      const c=(omDes+C2_KW*(omDes-c2.om))/c2.G;
+      const cc=Math.max(-1,Math.min(1,c));
+      c2.cp=cc;
+      s=-cc;
+    } else {
+      s=Math.max(-1,Math.min(1,
+        steerAngle*STEER_GAIN*
+        (1+LOW_SPEED_BOOST*Math.max(0,1-speed/150))*STEER_SIGN
+      ));
+    }
 
     let e=(bot.acc[id]??0)+s;
     let right=false,left=false;
@@ -1686,12 +1723,13 @@ else if (s < -0.18) left = true;
 
     bot.lastPos[id]={x:state.position.x,y:state.position.y,z:state.position.z};
 
-    const err = crossTrack(state.position, i);
-
-if (err > 1.8 && speed > 25) {
-  const fix = Math.sign(lat || 1) * Math.min(0.5, (err - 1.8) * 0.12);
-  bot.acc[id] = Math.max(-1, Math.min(1, (bot.acc[id] ?? 0) + fix));
-}
+    const err=crossTrack(state.position,i);
+    let hist=bot.hist[id];
+    if(!hist) { hist=[];bot.hist[id]=hist; }
+    if(state.frames%10===0 && (hist.length===0 || hist[hist.length-1][0]!==state.frames)) {
+      hist.push([state.frames,speed]);
+      if(hist.length>14) hist.shift();
+    }
 
     let vmax=0;
     for(const h of hist) if(h[0]>=state.frames-120 && h[1]>vmax) vmax=h[1];
@@ -1863,7 +1901,7 @@ if (err > 1.8 && speed > 25) {
     for(const a of s) {
       const air=(a[9]===0);
       const u=air ? {x:0,y:1,z:0} : rotateVec({x:a[4],y:a[5],z:a[6],w:a[7]},{x:0,y:1,z:0});
-      pts.push([a[1],a[2],a[3],Math.max(20,a[8]*0.95),u.x,u.y,u.z]);
+      pts.push([a[1],a[2],a[3],Math.max(20,Math.min(300,a[8]*LESSON_SPEED)),u.x,u.y,u.z]);
     }
     const out=[pts[0]]; let acc=0;
     for(let i=1;i<pts.length;i++) {
@@ -1940,11 +1978,39 @@ if (err > 1.8 && speed > 25) {
   ${generateRoute.toString()}
   ${generateRoute3D.toString()}
   const USE_3D = ${USE_3D};
+  const LESSON_SPEED = ${LESSON_SPEED};
+  const FAR_W = ${FAR_W}, FAR_SEC = ${FAR_SEC}, SMOOTH_SHIFT = ${SMOOTH_SHIFT};
+  const CTRL2 = ${CTRL2}, C2_KW = ${C2_KW}, C2_G0 = ${C2_G0}, C2_GRIP_FRAC = ${C2_GRIP_FRAC}, C2_FF = ${C2_FF};
 
   // ---- ROUTE SWITCHING ----
   const PER_CAR=["idx","acc","stuck","lastPos","lastFrames","hist","lastCrash","lastOff","lastCp","airSince","airV0",
-    "lastAirborne","keepSpeed","keepUntil","lastLand","lastBrakeLog","landSteerUntil","lastPitch","airMatched","finLogged"];
+    "lastAirborne","keepSpeed","keepUntil","lastLand","lastBrakeLog","landSteerUntil","lastPitch","airMatched","finLogged","c2"];
+  function smoothRoute(route) {
+    const n=route.length;
+    if(!(SMOOTH_SHIFT>0) || n<5) return route;
+    const P=route.map(p=>p.slice());
+    const ok=new Array(n).fill(false);
+    for(let i=1;i<n-1;i++) {
+      const a=route[i-1],b=route[i],c=route[i+1];
+      const flat=Math.abs(c[1]-a[1])<1.2 && Math.abs(b[1]-a[1])<0.8 && Math.abs(c[1]-b[1])<0.8;
+      const nyOk=b.length<7 || b[5]>0.9;
+      ok[i]=flat && nyOk;
+    }
+    for(let it=0;it<60;it++) {
+      for(let i=1;i<n-1;i++) {
+        if(!ok[i]) continue;
+        const o=route[i];
+        let nx=P[i][0]+0.4*((P[i-1][0]+P[i+1][0])/2-P[i][0]);
+        let nz=P[i][2]+0.4*((P[i-1][2]+P[i+1][2])/2-P[i][2]);
+        const dx=nx-o[0], dz=nz-o[2], d=Math.hypot(dx,dz);
+        if(d>SMOOTH_SHIFT) { nx=o[0]+dx/d*SMOOTH_SHIFT; nz=o[2]+dz/d*SMOOTH_SHIFT; }
+        P[i][0]=nx; P[i][2]=nz;
+      }
+    }
+    return P;
+  }
   function applyRoute(route,trackId,kind,quiet) {
+    if(!quiet && kind==="generated") route=smoothRoute(route);
     if(!quiet) { bot.baseRoute=route; bot.baseKind=kind; bot.patches=[]; }
     ROUTE=route; N=route.length; TRACK_ID=trackId;
     SLOW_ZONES = kind==="recorded" ? SLOW_ZONES_REC.slice() : [];
@@ -2048,6 +2114,7 @@ if (err > 1.8 && speed > 25) {
   bot.decode=decode;
   bot.choose=choose;
   bot.route=ROUTE;
+  bot.applyRoute=applyRoute;
   globalThis.__ptTutorialBot=bot;
 })();
 `;
@@ -2305,7 +2372,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.8.2";
+    this.modVersion="0.8.3";
     this.touchingPhysics=true;
   }
 
