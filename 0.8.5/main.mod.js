@@ -1623,7 +1623,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     const abs=Math.abs(angle);
 
     const useC2=CTRL2 && bot.routeKind!=="recorded";
-    let tSpeed=targetSpeed(i,(useC2 && bot.c2[id]) ? Math.max(0.6*LAT_ACCEL,bot.c2[id].A) : 0);
+    let tSpeed=targetSpeed(i,(useC2 && bot.c2[id] && !bot.c2[id].curved) ? Math.max(0.6*LAT_ACCEL,bot.c2[id].A) : 0);
     if(state.frames<(bot.keepUntil[id]||0) && bot.keepSpeed[id]>tSpeed) tSpeed=bot.keepSpeed[id];
     let up=true,down=false;
     // short blips of "too fast" are ignored (no random gas lifts or taps of the brake); real overspeed acts at once
@@ -1682,7 +1682,11 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       if(!c2) c2=bot.c2[id]={pf:null,pfr:state.frames,om:0,cf:0,cp:0,Sw:20*C2_G0,Su:20,G:C2_G0,A:LAT_ACCEL};
       const dtf=Math.max(1,state.frames-c2.pfr), dts=dtf/1000;
       const fresh=state.frames>c2.pfr;
-      if(fresh && c2.pf) {
+      // walls, banks, loops and ramp changes: the surface direction jumps, which would fake a turn rate and ruin the grip/turn-rate estimates
+      if(c2.pu && (c2.pu.x*upv.x+c2.pu.y*upv.y+c2.pu.z*upv.z)<0.995) c2.sk=state.frames+150;
+      c2.pu={x:upv.x,y:upv.y,z:upv.z};
+      c2.curved = upv.y<0.92 || state.wheels===0 || state.frames<(c2.sk||0);
+      if(fresh && c2.pf && !c2.curved) {
         const px=c2.pf.x,py=c2.pf.y,pz=c2.pf.z;
         const cx=(py*fz-pz*fy)*upv.x+(pz*fx-px*fz)*upv.y+(px*fy-py*fx)*upv.z;
         const dd=px*fx+py*fy+pz*fz;
@@ -1692,7 +1696,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       if(fresh || !c2.pf) { c2.pf={x:fx,y:fy,z:fz}; c2.pfr=state.frames; }
       // where the steering has got to, given the car's steering lag, then learn the real turn rate from it
       if(fresh) c2.cf+=(c2.cp-c2.cf)*Math.min(1,dts/0.107);
-      if(fresh && speed>40 && state.wheels!==0 && Math.abs(c2.cf)>0.15) {
+      if(fresh && !c2.curved && speed>40 && state.wheels!==0 && Math.abs(c2.cf)>0.15) {
         const lam=Math.pow(0.9995,dtf);
         c2.Sw=lam*c2.Sw+c2.om*c2.cf; c2.Su=lam*c2.Su+c2.cf*c2.cf;
         c2.G=Math.max(0.3,Math.min(3,c2.Sw/c2.Su));
@@ -1705,7 +1709,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
         const jf=Math.min(N-2,i+Math.max(1,Math.round(vms*0.25/5.5)));
         omDes+=C2_FF*vms*SKAP[jf];
       }
-      const c=(omDes+C2_KW*(omDes-c2.om))/c2.G;
+      const c = c2.curved ? omDes/Math.max(0.6,Math.min(1.2,c2.G)) : (omDes+C2_KW*(omDes-c2.om))/c2.G;
       const cc=Math.max(-1,Math.min(1,c));
       c2.cp=cc;
       s=-cc;
@@ -2391,7 +2395,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.8.4";
+    this.modVersion="0.8.5";
     this.touchingPhysics=true;
   }
 
