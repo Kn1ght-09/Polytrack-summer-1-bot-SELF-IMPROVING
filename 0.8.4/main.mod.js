@@ -36,17 +36,23 @@ const C2_KW = 1.0;         // damping: how hard it fights a turn rate that is to
 const C2_G0 = 0.8;         // first guess of the car's full-steer turn rate (rad/s); it learns the real value while driving
 const C2_FF = 0;           // steering preview: how much of the bend ahead the bot starts turning for early (0 = none)
 const SMOOTH_SHIFT = 0.8; // the line is straightened out by up to this many metres so turns start earlier and gentler (0 = off)
+const THR_LIFT = 3;   // km/h over the wanted speed before the bot lifts off the gas
+const THR_BRAKE = 12; // km/h over before it brakes
+const THR_BIG = 15;   // km/h over: acts immediately
+const LIFT_MS = 80;  // too fast for this long (ms) before lifting
+const BRAKE_MS = 40;  // too fast for this long (ms) before braking
+const CURV_DEAD = 0.04; // tiny wobbles in the line (under this many radians per point) don't count as a corner, so the bot stops slowing down in straight corridors
 const FAR_W = 0;         // early aim: how much the bot leans toward where the line goes further ahead (0 = off)
 const FAR_SEC = 0.9;     // how many seconds ahead the early aim looks
 const C2_GRIP_FRAC = 1.2;  // corners are taken at no more than this fraction of the sideways grip the bot has measured
-const LESSON_SPEED = 1.03; // taught sections: the bot aims for this fraction of YOUR speed (1.0 = same as you, 1.05 = 5% faster)
+const LESSON_SPEED = 1.08; // taught sections: the bot aims for this fraction of YOUR speed (1.0 = same as you, 1.05 = 5% faster)
 const DOWNLOAD_DRIVE = false; // true = also save a ptbot_drive.json file every time you stop recording
 const USE_3D = true; // build lines on the road surface itself (ramps, banks, walls, loops); false = old flat-road builder
 const REC_KEY = "o"; // press once to start recording YOUR driving (bot steps aside), press again to stop and save
 const AUTO_RESTART = true;
 const AUTO_START = true;
 const AUTO_START_MS = 100;
-const AUTO_START_DELAY = 700;
+const AUTO_START_DELAY = 60;
 const RESTART_KEY = { key: "t", code: "KeyT", keyCode: 84 };
 
 // ---- DRIVING SETTINGS ----
@@ -962,6 +968,7 @@ const WORKER_HELPERS = `
   const SPEED_FACTOR = ${SPEED_FACTOR};
   const STEER_GAIN = ${STEER_GAIN};
   const LAT_ACCEL = ${LAT_ACCEL};
+  const CURV_DEAD = ${CURV_DEAD};
   const LINE_PULL = ${LINE_PULL};
   const LOW_SPEED_BOOST = ${LOW_SPEED_BOOST};
   const SLOW_ZONES_REC = ${JSON.stringify(SLOW_ZONES)};
@@ -1125,6 +1132,7 @@ const WORKER_HELPERS = `
         const turn=Math.abs(cx*ROUTE[m][4]+cy*ROUTE[m][5]+cz*ROUTE[m][6]);
         dh=Math.atan2(turn,ux*vx+uy*vy+uz*vz);
       }
+      if(dh<3*CURV_DEAD) dh = dh<CURV_DEAD ? 0 : dh*(dh-CURV_DEAD)/(2*CURV_DEAD);
       const curv=dh/Math.max((la+lb)/2,1e-6);
       if(curv>kmax) kmax=curv;
     }
@@ -1618,8 +1626,18 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     let tSpeed=targetSpeed(i,(useC2 && bot.c2[id]) ? Math.max(0.6*LAT_ACCEL,bot.c2[id].A) : 0);
     if(state.frames<(bot.keepUntil[id]||0) && bot.keepSpeed[id]>tSpeed) tSpeed=bot.keepSpeed[id];
     let up=true,down=false;
-    if(speed>tSpeed+8 && speed>40) { up=false;down=true; }
-    else if(speed>tSpeed) up=false;
+    // short blips of "too fast" are ignored (no random gas lifts or taps of the brake); real overspeed acts at once
+    {
+      const ex=speed-tSpeed;
+      let ov=bot.over[id]||0;
+      const stepF=Math.max(1,Math.min(20,state.frames-(bot.overF[id]??state.frames)));
+      bot.overF[id]=state.frames;
+      ov = ex>THR_LIFT ? ov+stepF : 0;
+      bot.over[id]=ov;
+      const big=ex>THR_BIG;
+      if(speed>40 && ex>THR_BRAKE && (big || ov>=BRAKE_MS)) { up=false;down=true; }
+      else if(ex>THR_LIFT && (big || ov>=LIFT_MS)) up=false;
+    }
     // standing start: full throttle (the slow first route points used to hold the car back to about 25 km/h)
     if(i<8 && speed<60 && state.wheels!==0) { up=true; down=false; }
     if(abs>1.0 && speed>60) up=false;
@@ -1979,12 +1997,13 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
   ${generateRoute3D.toString()}
   const USE_3D = ${USE_3D};
   const LESSON_SPEED = ${LESSON_SPEED};
+  const THR_LIFT = ${THR_LIFT}, THR_BRAKE = ${THR_BRAKE}, THR_BIG = ${THR_BIG}, LIFT_MS = ${LIFT_MS}, BRAKE_MS = ${BRAKE_MS};
   const FAR_W = ${FAR_W}, FAR_SEC = ${FAR_SEC}, SMOOTH_SHIFT = ${SMOOTH_SHIFT};
   const CTRL2 = ${CTRL2}, C2_KW = ${C2_KW}, C2_G0 = ${C2_G0}, C2_GRIP_FRAC = ${C2_GRIP_FRAC}, C2_FF = ${C2_FF};
 
   // ---- ROUTE SWITCHING ----
   const PER_CAR=["idx","acc","stuck","lastPos","lastFrames","hist","lastCrash","lastOff","lastCp","airSince","airV0",
-    "lastAirborne","keepSpeed","keepUntil","lastLand","lastBrakeLog","landSteerUntil","lastPitch","airMatched","finLogged","c2"];
+    "lastAirborne","keepSpeed","keepUntil","lastLand","lastBrakeLog","landSteerUntil","lastPitch","airMatched","finLogged","c2","over","overF"];
   function smoothRoute(route) {
     const n=route.length;
     if(!(SMOOTH_SHIFT>0) || n<5) return route;
@@ -2372,7 +2391,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.8.3";
+    this.modVersion="0.8.4";
     this.touchingPhysics=true;
   }
 
