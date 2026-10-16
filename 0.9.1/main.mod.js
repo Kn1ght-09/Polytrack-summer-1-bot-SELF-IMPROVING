@@ -44,6 +44,7 @@ const BRAKE_MS = 40;  // too fast for this long (ms) before braking
 const CURV_DEAD = 0.04; // tiny wobbles in the line (under this many radians per point) don't count as a corner, so the bot stops slowing down in straight corridors
 const REPLAY = true;   // on ramps, walls and slopes that you taught, the bot presses what YOU pressed there (kept in step with where the car is)
 const REPLAY_FIX = 0.25; // how much the bot's own steering is mixed in to keep it on the line during a replay
+const IGNORE_RECORDED_SPEED_CAP = false; // true = the speed you drove in a lesson is NOT used as the bot's speed limit (only corner grip limits it). It can make the bot arrive at corners too fast.
 const FAR_W = 0;         // early aim: how much the bot leans toward where the line goes further ahead (0 = off)
 const FAR_SEC = 0.9;     // how many seconds ahead the early aim looks
 const C2_GRIP_FRAC = 1.2;  // corners are taken at no more than this fraction of the sideways grip the bot has measured
@@ -986,6 +987,7 @@ const WORKER_HELPERS = `
   const STEER_GAIN = ${STEER_GAIN};
   const LAT_ACCEL = ${LAT_ACCEL};
   const CURV_DEAD = ${CURV_DEAD};
+  const IGNORE_RECORDED_SPEED_CAP = ${IGNORE_RECORDED_SPEED_CAP};
   const REPLAY = ${REPLAY}, REPLAY_FIX = ${REPLAY_FIX};
   const LINE_PULL = ${LINE_PULL};
   const LOW_SPEED_BOOST = ${LOW_SPEED_BOOST};
@@ -1465,7 +1467,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
   }
 
   function targetSpeed(i,Aest) {
-    let best=Infinity;
+    let best=Infinity, limW="", limK=0, limM=0;
     const hi=Math.min(N-1,i+25);
     const Pi=paramsAt(i);
 
@@ -1474,9 +1476,12 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       let zc=1000;
       for(const z of SLOW_ZONES) { if(j>=z[0] && j<=z[1] && z[2]<zc) zc=z[2]; }
       const capG=(Aest>0 && KAP[j]>1e-4) ? 3.6*Math.sqrt(C2_GRIP_FRAC*Aest/KAP[j]) : 1000;
-      const v=Math.min(SPD[j]*SPEED_FACTOR*Pj.sp*(1+spdAt(j)),CAP[j],zc,capG)+Pi.br*(j-i);
-      if(v<best) best=v;
+      const routeCap=IGNORE_RECORDED_SPEED_CAP ? 1000 : SPD[j]*SPEED_FACTOR*Pj.sp*(1+spdAt(j));
+      const m=Math.min(routeCap,CAP[j],zc,capG);
+      const v=m+Pi.br*(j-i);
+      if(v<best) { best=v; limW = m===zc ? "slow zone" : (m===capG ? "grip" : (m===CAP[j] ? "bend" : "line speed")); limK=j-i; limM=m; }
     }
+    bot.lim={w:limW,k:limK,m:Math.round(limM)};
     return Math.max(best,25);
   }
 
@@ -1751,6 +1756,11 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       ));
     }
 
+    if(down && state.frames-(bot.lastBrakeDiag||-1e9)>400) {
+      bot.lastBrakeDiag=state.frames;
+      const lm=bot.lim||{};
+      console.log("PTBOT_BRAKE speed="+Math.round(speed)+" wanted="+Math.round(tSpeed)+" (limit: "+lm.w+" "+lm.m+" km/h, "+lm.k+" points ahead) point "+i+"/"+N+(bot.replaying?" replay":""));
+    }
     if(REPLAY && HARD[i] && ROUTE[i][8]!==undefined && Math.abs(lat)<2.2 && abs<1.0) {
       const sc=Math.max(-0.35,Math.min(0.35,REPLAY_FIX*s));
       s=Math.max(-1,Math.min(1,ROUTE[i][8]+sc));
@@ -2474,7 +2484,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.9.0";
+    this.modVersion="0.9.1";
     this.touchingPhysics=true;
   }
 
