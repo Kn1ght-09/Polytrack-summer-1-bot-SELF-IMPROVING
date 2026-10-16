@@ -184,6 +184,20 @@ function generateRoute3D(dec, opt) {
   opt = opt || {};
   var S = opt.step || 1.3, SPACING = opt.spacing || 5.5, MINCLR = opt.minClr || 3.0, VMAX = opt.vmax || 400;
   var GRAV = 16.0, VHS = [12, 35, 55, 75], VH = 55.0;
+  // big tracks: measure the surface first and widen the sampling grid so the number of samples stays manageable
+  // (a track that needs 2.5 million samples would freeze the game before it could give up)
+  var AREA_ = 0;
+  for (var pj = 0; pj < dec.parts.length; pj++) {
+    var ee = dec.lib[dec.parts[pj][3]]; if (!ee) continue; var vv = ee.v;
+    for (var ii = 0; ii + 8 < vv.length; ii += 9) {
+      var ux_=vv[ii+3]-vv[ii], uy_=vv[ii+4]-vv[ii+1], uz_=vv[ii+5]-vv[ii+2], wx_=vv[ii+6]-vv[ii], wy_=vv[ii+7]-vv[ii+1], wz_=vv[ii+8]-vv[ii+2];
+      var tx_=uy_*wz_-uz_*wy_, ty_=uz_*wx_-ux_*wz_, tz_=ux_*wy_-uy_*wx_;
+      AREA_ += 0.5*Math.sqrt(tx_*tx_+ty_*ty_+tz_*tz_);
+    }
+  }
+  var NODE_BUDGET = opt.nodeBudget || 300000;
+  var S_need = 1.3*Math.sqrt(0.96*AREA_/NODE_BUDGET);
+  if (S_need > S) S = Math.min(6, S_need);
   var NB = 16, RAD = S*1.7, T0 = Date.now();
 
   function qrot(q, x, y, z) {
@@ -231,7 +245,7 @@ function generateRoute3D(dec, opt) {
         if (fu + fv > 1.0001) continue;
         addNode(a[0]+ux*fu+wx*fv, a[1]+uy*fu+wy*fv, a[2]+uz*fu+wz*fv, tx, ty, tz);
       }
-      if (n > 2500000) return { ok: false, why: "track too large" };
+      if (n > 1500000) return { ok: false, why: "track too large" };
     }
   }
   seen = null;
@@ -604,6 +618,7 @@ function generateRoute(dec, opt) {
   }
   if (ups.length < 20) return { ok: false, why: "no road surfaces found" };
   minx = Math.floor(minx) - 6; minz = Math.floor(minz) - 6; maxx = Math.ceil(maxx) + 6; maxz = Math.ceil(maxz) + 6;
+  { var cs_ = Math.sqrt(((maxx-minx)*(maxz-minz))/1500000); if (cs_ > CELL) CELL = cs_; }
   var W = Math.floor((maxx-minx)/CELL) + 1, H = Math.floor((maxz-minz)/CELL) + 1;
   if (W*H > 6000000) return { ok: false, why: "track too large" };
 
@@ -1449,13 +1464,6 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     return Math.atan2(ROUTE[k][1]-ROUTE[k-1][1],dh);
   }
 
-  // The recorded/learned lap speed is not an engine top-speed limit.
-  // Keep it available for learning and diagnostics, but do not cap throttle
-  // to the speed you happened to reach during the recording. Only actual
-  // cornering/grip estimates and explicitly configured slow zones may ask us
-  // to lift or brake. This prevents the 303-306 km/h speed-hunting on straights.
-  const IGNORE_RECORDED_SPEED_CAP = true;
-
   function targetSpeed(i,Aest) {
     let best=Infinity;
     const hi=Math.min(N-1,i+25);
@@ -1466,8 +1474,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       let zc=1000;
       for(const z of SLOW_ZONES) { if(j>=z[0] && j<=z[1] && z[2]<zc) zc=z[2]; }
       const capG=(Aest>0 && KAP[j]>1e-4) ? 3.6*Math.sqrt(C2_GRIP_FRAC*Aest/KAP[j]) : 1000;
-      const routeCap=IGNORE_RECORDED_SPEED_CAP ? 1000 : SPD[j]*SPEED_FACTOR*Pj.sp*(1+spdAt(j));
-      const v=Math.min(routeCap,CAP[j],zc,capG)+Pi.br*(j-i);
+      const v=Math.min(SPD[j]*SPEED_FACTOR*Pj.sp*(1+spdAt(j)),CAP[j],zc,capG)+Pi.br*(j-i);
       if(v<best) best=v;
     }
     return Math.max(best,25);
@@ -1568,6 +1575,17 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
         }
       }
       return {up:true,right:false,down:false,left:false,reset:false};
+    }
+
+    // the line has a gap and the bot has driven all of it: hand the wheel to you for the rest
+    if(bot.gapOpen && !bot.recOn && state.finishFrames===null && (bot.idx[id]||0)>=N-3 && state.frames-(bot.gapLast??-1e9)>3000) {
+      bot.gapLast=state.frames;
+      const why=bot.gapWhy||"the line builder could not find a way on";
+      console.log("PTBOT_GAP line incomplete ("+why+") - recording started, drive from here to the finish (or the next part the bot can do), then press O again");
+      post({type:"lesson",text:"Line incomplete ("+why+"). Recording started: drive on from here, then press O when you are done."});
+      setRec(true);
+      post({type:"recstate",on:true});
+      return {up:false,right:false,down:false,left:false,reset:false};
     }
 
     const previousPos=bot.lastPos[id];
@@ -1992,10 +2010,30 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     }
     return {route:null,closest:closest};
   }
+  // the line stops at a gap the builder could not cross: your drive continues it from the end of the line
+  function spliceExtend(base,patch) {
+    const e=base[base.length-1];
+    let k0=-1,d0=1e18;
+    for(let k=0;k<patch.length;k++) {
+      const dx=patch[k][0]-e[0],dy=patch[k][1]-e[1],dz=patch[k][2]-e[2],q=dx*dx+dy*dy+dz*dz;
+      if(q<d0) { d0=q; k0=k; }
+    }
+    if(k0<0 || Math.sqrt(d0)>80 || patch.length-k0<3) return null;
+    const sub=patch.slice(k0);
+    let i0=base.length-1,bd=1e18;
+    for(let i=Math.max(0,base.length-40);i<base.length;i++) {
+      const dx=base[i][0]-sub[0][0],dy=base[i][1]-sub[0][1],dz=base[i][2]-sub[0][2],q=dx*dx+dy*dy+dz*dz;
+      if(q<bd) { bd=q; i0=i; }
+    }
+    while(sub[0].length<10) sub[0].push(0);
+    sub[0][10]=1; // marks this lesson as a continuation of the line
+    return {route:base.slice(0,i0).concat(sub),sub:sub,from:i0,to:base.length-1,thr:Math.round(Math.sqrt(d0))};
+  }
   function learnLesson(samples) {
     const patch=buildPatch(samples);
     if(!patch) { post({type:"lesson",text:"Lesson too short - drive a bit further"}); console.log("PTBOT_LESSON too short, nothing saved"); return; }
-    const res=spliceRoute(ROUTE,patch);
+    let res=bot.gapOpen ? spliceExtend(ROUTE,patch) : null;
+    if(!res) res=spliceRoute(ROUTE,patch);
     if(!res.route) {
       post({type:"lesson",text:"Nothing saved: your driving got no closer than "+Math.round(res.closest)+" m to the bot's line"});
       console.log("PTBOT_LESSON nothing saved: the closest your drive got to the bot's line was "+Math.round(res.closest)+" m (needs under 80 m, and your drive has to go forward along the line). Your drive started at "+Math.round(patch[0][0])+","+Math.round(patch[0][1])+","+Math.round(patch[0][2])+" and ended at "+Math.round(patch[patch.length-1][0])+","+Math.round(patch[patch.length-1][1])+","+Math.round(patch[patch.length-1][2]));
@@ -2011,7 +2049,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
   function loadLessons(list) {
     if(!Array.isArray(list) || !list.length || !bot.baseRoute) return;
     let route=bot.baseRoute, used=[];
-    for(const p of list) { const r=Array.isArray(p) && p.length>=2 ? spliceRoute(route,p,true) : null; if(r && r.route) { route=r.route; used.push(r.sub); } }
+    for(const p of list) { const r=Array.isArray(p) && p.length>=2 ? ((p[0] && p[0][10]===1) ? (spliceExtend(route,p) || spliceRoute(route,p,true)) : spliceRoute(route,p,true)) : null; if(r && r.route) { route=r.route; used.push(r.sub); } }
     if(!used.length) { post({type:"lesson",text:"Found "+list.length+" saved lesson(s) but they no longer fit this track's line"}); console.log("PTBOT_LESSON found saved lessons but they do not fit this line any more"); return; }
     post({type:"lesson",text:"Loaded "+used.length+" saved lesson(s) for this track"});
     bot.patches=used;
@@ -2142,6 +2180,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
           if(gen && gen.ok) {
             console.log("PTBOT_ROUTE built a line from the track: "+gen.route.length+" points, "+gen.lengthM+" m, "+gen.jumps+" jump(s), "+gen.ms+" ms");
             applyRoute(gen.route,tid,"generated");
+            bot.gapOpen=!!gen.partial; bot.gapWhy=gen.partial||null;
+            if(gen.partial) console.log("PTBOT_ROUTE line incomplete: "+gen.partial+". The bot will drive the part it has, then hand over to you to record the rest.");
             try { if(ch) ch.postMessage({type:"route",info:{track:tid,points:gen.route.length,lengthM:gen.lengthM,jumps:gen.jumps,ms:gen.ms,waypoints:gen.waypoints},route:gen.route}); } catch(_) {}
           } else if(ROUTE_SOURCE==="generated" && recMatches) {
             console.log("PTBOT_ROUTE could not build a line ("+(gen?gen.why:"?")+"), using your recorded lap instead");
@@ -2349,8 +2389,8 @@ function setupMainThread() {
   window.ptRecord=(on)=>{
     recOn=(on===undefined)?!recOn:!!on;
     ch.postMessage({type:"rec",on:recOn});
-    toast(recOn?"TEACHING: drive the hard spot yourself, then press "+REC_KEY.toUpperCase()+" again":"");
-    console.log(recOn?"PTBOT_REC on: drive the track yourself, press "+REC_KEY.toUpperCase()+" again when done":"PTBOT_REC off: saving...");
+    toast(recOn?"TEACHING: drive the hard spot yourself, then press O again":"");
+    console.log(recOn?"PTBOT_REC on: drive the track yourself, press O again when done":"PTBOT_REC off: saving...");
   };
   window.ptClearLessons=()=>{ ch.postMessage({type:"clearPatches"}); try { localStorage.removeItem(patchKey(lastLessonKey)); } catch (_) {} console.log("lessons cleared for this track"); };
   window.ptLessonsDump=()=>{
@@ -2360,7 +2400,7 @@ function setupMainThread() {
     console.log("saved ptbot_lessons.json with "+Object.keys(all).length+" track(s)");
   };
   window.ptDriveDump=(withTrack)=>{
-    if(!window.__ptDrive) { console.log("no driving recorded yet - press "+REC_KEY.toUpperCase()+", drive, press "+REC_KEY.toUpperCase()+" again"); return; }
+    if(!window.__ptDrive) { console.log("no driving recorded yet - press O, drive, press O again"); return; }
     ptDownload("ptbot_drive.json",JSON.stringify({drive:window.__ptDrive,track:(withTrack===false)?null:(window.__ptTrack||null)}));
     console.log("saved ptbot_drive.json ("+window.__ptDrive.samples.length+" samples, with track: "+(withTrack!==false&&!!window.__ptTrack)+")");
   };
@@ -2397,6 +2437,8 @@ function setupMainThread() {
       try {
         if(m.list&&m.list.length) { localStorage.setItem(patchKey(m.lesson),JSON.stringify(m.list)); console.log("PTBOT_LESSON the page saved "+m.list.length+" lesson(s) for this track"); } else localStorage.removeItem(patchKey(m.lesson));
       } catch (_) {}
+    } else if(m.type==="recstate") {
+      recOn=!!m.on; if(recOn) toast("RECORDING: drive on from here, then press O when you are done");
     } else if(m.type==="lesson") {
       toast(m.text); console.log("PTBOT_LESSON "+m.text);
       setTimeout(()=>{ if(!recOn) toast(""); },5000);
@@ -2432,7 +2474,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.8.9";
+    this.modVersion="0.9.0";
     this.touchingPhysics=true;
   }
 
