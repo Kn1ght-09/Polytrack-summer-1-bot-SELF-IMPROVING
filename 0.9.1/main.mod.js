@@ -1477,9 +1477,12 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       for(const z of SLOW_ZONES) { if(j>=z[0] && j<=z[1] && z[2]<zc) zc=z[2]; }
       const capG=(Aest>0 && KAP[j]>1e-4) ? 3.6*Math.sqrt(C2_GRIP_FRAC*Aest/KAP[j]) : 1000;
       const routeCap=IGNORE_RECORDED_SPEED_CAP ? 1000 : SPD[j]*SPEED_FACTOR*Pj.sp*(1+spdAt(j));
-      const m=Math.min(routeCap,CAP[j],zc,capG);
+      // points you taught: you already drove them at that speed, so the bot's own bend/grip guesses must not hold it below it
+      // (they held it near 305 km/h where you did 400)
+      const taught = ROUTE[j][8]!==undefined;
+      const m = taught ? Math.min(SPD[j]*SPEED_FACTOR,zc) : Math.min(routeCap,CAP[j],zc,capG);
       const v=m+Pi.br*(j-i);
-      if(v<best) { best=v; limW = m===zc ? "slow zone" : (m===capG ? "grip" : (m===CAP[j] ? "bend" : "line speed")); limK=j-i; limM=m; }
+      if(v<best) { best=v; limW = m===zc ? "slow zone" : (m===capG ? "grip" : (taught ? "your lesson speed" : (m===CAP[j] ? "bend" : "line speed"))); limK=j-i; limM=m; }
     }
     bot.lim={w:limW,k:limK,m:Math.round(limM)};
     return Math.max(best,25);
