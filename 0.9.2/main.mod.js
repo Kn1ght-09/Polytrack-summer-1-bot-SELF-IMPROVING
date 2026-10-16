@@ -44,6 +44,7 @@ const BRAKE_MS = 40;  // too fast for this long (ms) before braking
 const CURV_DEAD = 0.04; // tiny wobbles in the line (under this many radians per point) don't count as a corner, so the bot stops slowing down in straight corridors
 const REPLAY = true;   // on ramps, walls and slopes that you taught, the bot presses what YOU pressed there (kept in step with where the car is)
 const REPLAY_FIX = 0.25; // how much the bot's own steering is mixed in to keep it on the line during a replay
+const BEHIND_MS = 1000; // restart a learning run when it is this many ms behind the best run's pace (part-way between checkpoints)
 const IGNORE_RECORDED_SPEED_CAP = false; // true = the speed you drove in a lesson is NOT used as the bot's speed limit (only corner grip limits it). It can make the bot arrive at corners too fast.
 const FAR_W = 0;         // early aim: how much the bot leans toward where the line goes further ahead (0 = off)
 const FAR_SEC = 0.9;     // how many seconds ahead the early aim looks
@@ -988,6 +989,7 @@ const WORKER_HELPERS = `
   const LAT_ACCEL = ${LAT_ACCEL};
   const CURV_DEAD = ${CURV_DEAD};
   const IGNORE_RECORDED_SPEED_CAP = ${IGNORE_RECORDED_SPEED_CAP};
+  const BEHIND_MS = ${BEHIND_MS};
   const REPLAY = ${REPLAY}, REPLAY_FIX = ${REPLAY_FIX};
   const LINE_PULL = ${LINE_PULL};
   const LOW_SPEED_BOOST = ${LOW_SPEED_BOOST};
@@ -1264,6 +1266,7 @@ const WORKER_HELPERS = `
   function failRun(why,state) {
     if(!LEARN || L.pending) return;
     if(L.run) L.run.failed=true;
+    console.log("PTBOT_FAIL "+why+" | last 2s (time speed wanted offset steer keys): "+(bot.ring||[]).slice(-40).join(" | "));
     console.log("PTBOT_LEARN fail: "+why+" (frame "+state.frames+", checkpoints done this run: "+(L.run ? L.run.cps.length : 0)+")");
     requestRestart(300,why,state.frames);
   }
@@ -1433,9 +1436,25 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     }
   }
 
+  let pendingBuild=null;
   if(ch) {
     ch.onmessage=(ev) => {
       const m=ev.data || {};
+      if(m.type==="routea") {
+        if(pendingBuild && pendingBuild.key===m.key) {
+          clearTimeout(pendingBuild.timer);
+          const pb=pendingBuild; pendingBuild=null;
+          try {
+            if(Array.isArray(m.route) && m.route.length>5) {
+              console.log("PTBOT_ROUTE loaded the saved line for this track ("+m.route.length+" points) - no building needed");
+              applyRoute(m.route,pb.tid,"generated");
+              bot.gapOpen=!!m.gap; bot.gapWhy=m.gap||null;
+              if(m.gap) console.log("PTBOT_ROUTE line incomplete: "+m.gap+". The bot will drive the part it has, then hand over to you to record the rest.");
+            } else pb.go();
+          } catch(err) { console.log("PTBOT_ROUTE saved line failed ("+String(err)+"), building a new one"); pb.go(); }
+        }
+        return;
+      }
       if(m.type==="rec") { try { setRec(!!m.on); } catch(_) {} return; }
       if(m.type==="patches" && (m.lesson||null)===(LESSON_KEY||null)) { try { loadLessons(m.list); } catch(err) { console.log("PTBOT_LESSON load failed: "+String(err)); } return; }
       if(m.type==="clearPatches") { try { clearLessons(); } catch(_) {} return; }
@@ -1480,7 +1499,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       // points you taught: you already drove them at that speed, so the bot's own bend/grip guesses must not hold it below it
       // (they held it near 305 km/h where you did 400)
       const taught = ROUTE[j][8]!==undefined;
-      const m = taught ? Math.min(SPD[j]*SPEED_FACTOR,zc) : Math.min(routeCap,CAP[j],zc,capG);
+      // on ramps/walls the copied steering only fits YOUR speed, so there the bot does exactly your speed (no bonus)
+      const m = taught ? Math.min((HARD[j] ? SPD[j]/LESSON_SPEED : SPD[j])*SPEED_FACTOR,zc) : Math.min(routeCap,CAP[j],zc,capG);
       const v=m+Pi.br*(j-i);
       if(v<best) { best=v; limW = m===zc ? "slow zone" : (m===capG ? "grip" : (taught ? "your lesson speed" : (m===CAP[j] ? "bend" : "line speed"))); limK=j-i; limM=m; }
     }
@@ -1550,6 +1570,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       bot.lastCrash[id]=-100000;
       bot.lastOff[id]=-100000;
       bot.finLogged[id]=false;
+      bot.offDump=false;
       bot.lastCp[id]=undefined;
       bot.lastAirborne[id]=false;
       bot.keepSpeed[id]=0;
@@ -1764,12 +1785,19 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       const lm=bot.lim||{};
       console.log("PTBOT_BRAKE speed="+Math.round(speed)+" wanted="+Math.round(tSpeed)+" (limit: "+lm.w+" "+lm.m+" km/h, "+lm.k+" points ahead) point "+i+"/"+N+(bot.replaying?" replay":""));
     }
-    if(REPLAY && HARD[i] && ROUTE[i][8]!==undefined && Math.abs(lat)<2.2 && abs<1.0) {
-      const sc=Math.max(-0.35,Math.min(0.35,REPLAY_FIX*s));
+    if(REPLAY && HARD[i] && ROUTE[i][8]!==undefined && Math.abs(lat)<3.5 && abs<1.0) {
+      const lim=0.35+0.25*Math.abs(lat);
+      const sc=Math.max(-lim,Math.min(lim,REPLAY_FIX*s*(1+Math.abs(lat))));
       s=Math.max(-1,Math.min(1,ROUTE[i][8]+sc));
       up=ROUTE[i][9]===1; down=ROUTE[i][9]===2;
       bot.replaying=true;
     } else bot.replaying=false;
+    if(state.frames-(bot.ringF??-1e9)>=50) {
+      bot.ringF=state.frames;
+      if(!bot.ring) bot.ring=[];
+      bot.ring.push((state.frames/1000).toFixed(2)+"s v"+Math.round(speed)+" w"+Math.round(tSpeed)+" off"+lat.toFixed(1)+" st"+s.toFixed(2)+(up?" U":"")+(down?" D":"")+(state.wheels===0?" air":"")+(bot.replaying?" rp":"")+" i"+i);
+      if(bot.ring.length>40) bot.ring.shift();
+    }
 
     let e=(bot.acc[id]??0)+s;
     let right=false,left=false;
@@ -1825,6 +1853,23 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       var OFFLINE_SPEED_FACTOR = speed > 140 ? 8 : 0;
       var offlineThreshold = (state.wheels === 0) ? OFFLINE_AIR : (OFFLINE_BASE + OFFLINE_SPEED_FACTOR);
       if (err > offlineThreshold) failRun("far off the line ("+err.toFixed(0)+" m)",state);
+      // clearly behind the ghost part-way to a checkpoint: don't wait for the checkpoint, start again
+      if(L.run && !L.run.failed && !L.pending && state.frames>3000) {
+        const B=L.best, kk=L.run.cps.length;
+        if(kk<B.gt.length && B.cp[kk] && (kk===0 || B.cp[kk-1])) {
+          const i1=B.cp[kk].idx, i0=kk>0 ? B.cp[kk-1].idx : 0;
+          const t1=B.gt[kk], t0=kk>0 ? B.gt[kk-1] : 0;
+          if(i1>i0 && i>=i0) {
+            const ghostT=t0+(t1-t0)*Math.min(1,(i-i0)/(i1-i0));
+            const behind=state.frames-ghostT;
+            if(behind>BEHIND_MS+0.15*(t1-t0)) failRun("behind the ghost by "+(behind/1000).toFixed(1)+" s on the way to checkpoint "+(kk+1),state);
+          }
+        }
+      }
+    }
+    if(err>5 && !bot.offDump) {
+      bot.offDump=true;
+      console.log("PTBOT_OFFDUMP first time off the line this run | last 2s (time speed wanted offset steer keys): "+(bot.ring||[]).slice(-40).join(" | "));
     }
     if(err>5 && state.frames-(bot.lastOff[id]??-100000)>150) {
       bot.lastOff[id]=state.frames;
@@ -1833,6 +1878,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
         "speed="+Math.round(speed),"pos="+state.position.x.toFixed(0)+","+state.position.z.toFixed(0));
     }
 
+    if(reset) console.log("PTBOT_RESETDUMP last 2s: "+(bot.ring||[]).slice(-40).join(" | "));
     if(reset) console.log("PTBOT_RESET","frame="+state.frames,"idx="+i+"/"+(N-1),
       "pos="+state.position.x.toFixed(0)+","+state.position.z.toFixed(0));
 
@@ -2168,6 +2214,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
           console.log("PTBOT_ROUTE using your recorded lap for this track");
           applyRoute(ROUTE_REC,null,"recorded");
         } else {
+          const ckey=tid+"_"+"r1"+(USE_3D?"3":"2");
+          const finishBuild=()=>{
           const decIn={parts:parts,lib:TRACK_LIB,start:start};
           let gen3=null;
           if(USE_3D) {
@@ -2195,7 +2243,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
             applyRoute(gen.route,tid,"generated");
             bot.gapOpen=!!gen.partial; bot.gapWhy=gen.partial||null;
             if(gen.partial) console.log("PTBOT_ROUTE line incomplete: "+gen.partial+". The bot will drive the part it has, then hand over to you to record the rest.");
-            try { if(ch) ch.postMessage({type:"route",info:{track:tid,points:gen.route.length,lengthM:gen.lengthM,jumps:gen.jumps,ms:gen.ms,waypoints:gen.waypoints},route:gen.route}); } catch(_) {}
+            try { if(ch) ch.postMessage({type:"route",info:{track:tid,points:gen.route.length,lengthM:gen.lengthM,jumps:gen.jumps,ms:gen.ms,waypoints:gen.waypoints},route:gen.route,key:ckey,gap:gen.partial||null}); } catch(_) {}
           } else if(ROUTE_SOURCE==="generated" && recMatches) {
             console.log("PTBOT_ROUTE could not build a line ("+(gen?gen.why:"?")+"), using your recorded lap instead");
             applyRoute(ROUTE_REC,null,"recorded");
@@ -2203,6 +2251,11 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
             console.log("PTBOT_ROUTE could not build a line: "+(gen?gen.why:"?")+". The bot will only drive forward on this track.");
             bot.noRoute=true;
           }
+          };
+          if(ch) {
+            pendingBuild={key:ckey,tid:tid,go:finishBuild,timer:setTimeout(()=>{ if(pendingBuild && pendingBuild.key===ckey) { const pb=pendingBuild; pendingBuild=null; pb.go(); } },1500)};
+            post({type:"routeq",key:ckey});
+          } else finishBuild();
         }
       }
       let clean=null;
@@ -2462,7 +2515,20 @@ function setupMainThread() {
       window.__ptDrive=m;
       console.log("PTBOT_REC saved on the page: "+m.samples.length+" samples (type ptDriveDump() to save them as a file).");
       if(DOWNLOAD_DRIVE) window.ptDriveDump();
+    } else if(m.type==="routeq") {
+      let out={type:"routea",key:m.key,route:null,gap:null};
+      try { const t=localStorage.getItem("ptbot_route_v1_"+m.key); if(t) { const o=JSON.parse(t); out.route=o.route; out.gap=o.gap||null; } } catch (_) {}
+      try { ch.postMessage(out); } catch (_) {}
     } else if(m.type==="route") {
+      try {
+        if(m.key && m.route) {
+          localStorage.setItem("ptbot_route_v1_"+m.key,JSON.stringify({route:m.route,gap:m.gap||null}));
+          let idx=[]; try { idx=JSON.parse(localStorage.getItem("ptbot_route_v1_idx")||"[]"); } catch (_) {}
+          idx=idx.filter(k=>k!==m.key); idx.push(m.key);
+          while(idx.length>10) { try { localStorage.removeItem("ptbot_route_v1_"+idx.shift()); } catch (_) {} }
+          localStorage.setItem("ptbot_route_v1_idx",JSON.stringify(idx));
+        }
+      } catch (_) {}
       window.__ptRoute=m;
       console.log("PTBOT_ROUTE (page) line built: "+m.info.points+" points, "+m.info.lengthM+" m, "+m.info.jumps+" jump(s). Type ptRouteDump() to save it as a file.");
     } else if(m.type==="save") {
@@ -2487,7 +2553,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.9.1";
+    this.modVersion="0.9.2";
     this.touchingPhysics=true;
   }
 
