@@ -41,15 +41,16 @@ const THR_BRAKE = 12; // km/h over before it brakes
 const THR_BIG = 15;   // km/h over: acts immediately
 const LIFT_MS = 80;  // too fast for this long (ms) before lifting
 const BRAKE_MS = 40;  // too fast for this long (ms) before braking
-const CURV_DEAD = 0.04; // tiny wobbles in the line (under this many radians per point) don't count as a corner, so the bot stops slowing down in straight corridors
+const CURV_DEAD = 0.03; // tiny wobbles in the line (under this many radians per point) don't count as a corner, so the bot stops slowing down in straight corridors
 const REPLAY = true;   // on ramps, walls and slopes that you taught, the bot presses what YOU pressed there (kept in step with where the car is)
-const REPLAY_FIX = 0.25; // how much the bot's own steering is mixed in to keep it on the line during a replay
+const REPLAY_FF = 0.6;   // how much of YOUR steering is added on top of the bot's own steering on ramps/walls (0 = bot steers alone, 1 = your full steering)
+const REPLAY_FIX = 0.25; // (old setting, not used any more)
 const BEHIND_MS = 1000; // restart a learning run when it is this many ms behind the best run's pace (part-way between checkpoints)
 const IGNORE_RECORDED_SPEED_CAP = false; // true = the speed you drove in a lesson is NOT used as the bot's speed limit (only corner grip limits it). It can make the bot arrive at corners too fast.
 const FAR_W = 0;         // early aim: how much the bot leans toward where the line goes further ahead (0 = off)
 const FAR_SEC = 0.9;     // how many seconds ahead the early aim looks
 const C2_GRIP_FRAC = 1.2;  // corners are taken at no more than this fraction of the sideways grip the bot has measured
-const LESSON_SPEED = 1.08; // taught sections: the bot aims for this fraction of YOUR speed (1.0 = same as you, 1.05 = 5% faster)
+const LESSON_SPEED = 1.05; // taught sections: the bot aims for this fraction of YOUR speed (1.0 = same as you, 1.05 = 5% faster)
 const DOWNLOAD_DRIVE = false; // true = also save a ptbot_drive.json file every time you stop recording
 const USE_3D = true; // build lines on the road surface itself (ramps, banks, walls, loops); false = old flat-road builder
 const REC_KEY = "o"; // press once to start recording YOUR driving (bot steps aside), press again to stop and save
@@ -990,7 +991,7 @@ const WORKER_HELPERS = `
   const CURV_DEAD = ${CURV_DEAD};
   const IGNORE_RECORDED_SPEED_CAP = ${IGNORE_RECORDED_SPEED_CAP};
   const BEHIND_MS = ${BEHIND_MS};
-  const REPLAY = ${REPLAY}, REPLAY_FIX = ${REPLAY_FIX};
+  const REPLAY = ${REPLAY}, REPLAY_FF = ${REPLAY_FF};
   const LINE_PULL = ${LINE_PULL};
   const LOW_SPEED_BOOST = ${LOW_SPEED_BOOST};
   const SLOW_ZONES_REC = ${JSON.stringify(SLOW_ZONES)};
@@ -1500,7 +1501,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       // (they held it near 305 km/h where you did 400)
       const taught = ROUTE[j][8]!==undefined;
       // on ramps/walls the copied steering only fits YOUR speed, so there the bot does exactly your speed (no bonus)
-      const m = taught ? Math.min((HARD[j] ? SPD[j]/LESSON_SPEED : SPD[j])*SPEED_FACTOR,zc) : Math.min(routeCap,CAP[j],zc,capG);
+      const m = taught ? Math.min(((HARD[j] || KAP[j]>0.003) ? SPD[j]/LESSON_SPEED : SPD[j])*SPEED_FACTOR,zc) : Math.min(routeCap,CAP[j],zc,capG);
       const v=m+Pi.br*(j-i);
       if(v<best) { best=v; limW = m===zc ? "slow zone" : (m===capG ? "grip" : (taught ? "your lesson speed" : (m===CAP[j] ? "bend" : "line speed"))); limK=j-i; limM=m; }
     }
@@ -1785,11 +1786,11 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       const lm=bot.lim||{};
       console.log("PTBOT_BRAKE speed="+Math.round(speed)+" wanted="+Math.round(tSpeed)+" (limit: "+lm.w+" "+lm.m+" km/h, "+lm.k+" points ahead) point "+i+"/"+N+(bot.replaying?" replay":""));
     }
-    if(REPLAY && HARD[i] && ROUTE[i][8]!==undefined && Math.abs(lat)<3.5 && abs<1.0) {
-      const lim=0.35+0.25*Math.abs(lat);
-      const sc=Math.max(-lim,Math.min(lim,REPLAY_FIX*s*(1+Math.abs(lat))));
-      s=Math.max(-1,Math.min(1,ROUTE[i][8]+sc));
-      up=ROUTE[i][9]===1; down=ROUTE[i][9]===2;
+    if(REPLAY && HARD[i] && ROUTE[i][8]!==undefined && Math.abs(lat)<3.5 && abs<0.7) {
+      // your steering is added to the bot's own steering: on the line it supplies the shape of the manoeuvre,
+      // off the line the bot's own steering wins
+      s=Math.max(-1,Math.min(1,s+REPLAY_FF*ROUTE[i][8]));
+      if(Math.abs(lat)<2) { up=ROUTE[i][9]===1; down=ROUTE[i][9]===2; }
       bot.replaying=true;
     } else bot.replaying=false;
     if(state.frames-(bot.ringF??-1e9)>=50) {
@@ -2553,7 +2554,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.9.2";
+    this.modVersion="0.9.3";
     this.touchingPhysics=true;
   }
 
