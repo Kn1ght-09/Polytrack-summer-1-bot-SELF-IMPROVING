@@ -2039,7 +2039,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
   function setRec(on) {
     if(on===bot.recOn) return;
     bot.recOn=on;
-    if(on) { bot.recS=[]; bot.recLast=-1; bot.enabled=false; console.log("PTBOT_REC started - you drive now"); }
+    if(on) { bot.recS=[]; bot.recLast=-1; bot.enabled=false; bot.repId=null; bot.repLog=0; console.log("PTBOT_REC started - you drive now"); }
     else {
       bot.enabled=true;
       console.log("PTBOT_REC stopped, "+bot.recS.length+" samples");
@@ -2326,6 +2326,16 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
 `;
 
 const BOT_BODY = `
+  if (!e.userControls && globalThis.__ptTutorialBot && globalThis.__ptTutorialBot.recOn) {
+    const __pb = globalThis.__ptTutorialBot;
+    try {
+      if(!__pb.repLog) { __pb.repLog=1; console.log("PTBOT_REPLAYCAR first non-player car seen while recording: id="+e.id+" fields="+Object.keys(e).join(",")); }
+      const __buf = new Uint8Array(t.HEAPU8.buffer, i, 227).slice();
+      const __st = __pb.decode(__buf.buffer);
+      if(__pb.repId===undefined || __pb.repId===null) __pb.repId=e.id;
+      if(e.id===__pb.repId) __pb.sample(__st,r,e.id);
+    } catch (_) {}
+  }
   if (e.userControls && globalThis.__ptTutorialBot) {
     const __ptBot = globalThis.__ptTutorialBot;
     let previous = null;
@@ -2593,7 +2603,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.0.2";
+    this.modVersion="1.0.3";
     this.touchingPhysics=true;
   }
 
