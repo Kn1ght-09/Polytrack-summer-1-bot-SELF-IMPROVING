@@ -1592,12 +1592,17 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
 
     if(EXACT_REPLAY && bot.exact && !bot.recOn) {
       const X=bot.exact;
-      const exAbort=(why)=>{ if(!bot.exAbort) { bot.exAbort=true; console.log("PTBOT_OPT run "+bot.exRun+" stopped: "+why); } if(!bot.exRs) { bot.exRs=true; post({type:"restart",delay:300}); } };
+      const exAbort=(why)=>{ if(!bot.exAbort) { bot.exAbort=true; console.log("PTBOT_OPT run "+bot.exRun+" stopped: "+why);
+          if(bot.exVerify && bot.exCand===bot.exVerify.bits) { console.log("PTBOT_OPT the faster run did not repeat, dropped"); bot.exVerify=null; }
+          else if(bot.exControl) { bot.exCtlFail++; console.log("PTBOT_OPT CONTROL run failed: the same presses gave a different result ("+bot.exCtlFail+" in a row)"); if(bot.exCtlFail>=2) exRevert("the saved presses do not repeat"); } } if(!bot.exRs) { bot.exRs=true; post({type:"restart",delay:300}); } };
       if(bot.exStart===undefined || state.frames<bot.exactLastF) {
-        bot.exStart=true; bot.exactOff=false; bot.exFin=false; bot.exAbort=false; bot.exRs=false;
+        bot.exStart=true; bot.exStep=0; bot.exMis=0; bot.exactOff=false; bot.exFin=false; bot.exAbort=false; bot.exRs=false;
         bot.exTraj=[]; bot.exCps=[]; bot.exLastCp=state.nextCheckpointIndex||0; bot.exactN=0; bot.exactLogs=0;
         bot.exRun=(bot.exRun||0)+1; bot.exCand=null; bot.exMut=null;
-        if(EXACT_OPT && bot.exBestT<Infinity) {
+        bot.exControl=false; bot.exStrict=EXACT_OPT && bot.exBestT<Infinity;
+        if(bot.exStrict && bot.exVerify) { bot.exCand=bot.exVerify.bits; bot.exMut=bot.exVerify.mut; }
+        else if(bot.exStrict && bot.exRun%4===0) { bot.exControl=true; }
+        else if(EXACT_OPT && bot.exBestT<Infinity) {
           const cand=X.bits.slice(), lim=Math.min(X.n,bot.exBestT+5);
           let f=-1;
           for(let tries=0;tries<80 && lim>10;tries++) { const g=1+Math.floor(Math.random()*(lim-2)); if(cand[g]!==cand[g-1] && ((cand[g]^cand[g-1])&~1)) { f=g; break; } }
@@ -1608,23 +1613,34 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
             bot.exCand=cand; bot.exMut={f:f,k:k};
           }
         }
-        console.log("PTBOT_OPT run "+bot.exRun+": "+(bot.exMut ? "trying a press moved "+(bot.exMut.k>0?"later":"earlier")+" by "+Math.abs(bot.exMut.k)+" ms at "+(bot.exMut.f/1000).toFixed(2)+" s" : "the replay as it is")+(bot.exBestT<Infinity ? " (best so far "+(bot.exBestT/1000).toFixed(3)+" s)" : ""));
+        console.log("PTBOT_OPT run "+bot.exRun+": "+(bot.exControl ? "CONTROL run: the best presses unchanged, should repeat the best time exactly" : bot.exVerify ? "checking that the faster run repeats" : bot.exMut ? "trying a press moved "+(bot.exMut.k>0?"later":"earlier")+" by "+Math.abs(bot.exMut.k)+" ms at "+(bot.exMut.f/1000).toFixed(2)+" s" : "the replay as it is")+(bot.exBestT<Infinity ? " (best so far "+(bot.exBestT/1000).toFixed(3)+" s)" : ""));
       }
       bot.exactLastF=state.frames;
+      const stepNo=bot.exStep++;
+      if(stepNo!==state.frames && (bot.exMis=(bot.exMis||0)+1)<=6) console.log("PTBOT_EXACT clock mismatch: game frame "+state.frames+" but this is step "+stepNo+" of the run");
       const bits=bot.exCand||X.bits;
       const mutating=!!bot.exCand;
       if(!bot.exFin && state.finishFrames!==null) {
         bot.exFin=true;
         const T=state.finishFrames;
         if(!bot.exactOff && !bot.exAbort) {
-          if(!mutating) {
+          if(!mutating && !bot.exControl) {
             if(T<bot.exBestT) { bot.exBestT=T; bot.exBestCps=bot.exCps.slice(); }
             console.log("PTBOT_OPT run "+bot.exRun+" finished in "+(T/1000).toFixed(3)+" s (the replay to beat)");
+          } else if(bot.exControl) {
+            if(T===bot.exBestT) { bot.exCtlFail=0; console.log("PTBOT_OPT CONTROL run finished in "+(T/1000).toFixed(3)+" s - exactly the same as the best, so the presses repeat"); }
+            else { bot.exCtlFail++; console.log("PTBOT_OPT CONTROL run finished in "+(T/1000).toFixed(3)+" s but the best is "+(bot.exBestT/1000).toFixed(3)+" s - the same presses did NOT repeat ("+bot.exCtlFail+" in a row)"); if(bot.exCtlFail>=2) exRevert("the saved presses do not repeat"); }
+          } else if(bot.exVerify && bot.exCand===bot.exVerify.bits) {
+            if(T<=bot.exVerify.T && T<bot.exBestT) {
+              console.log("PTBOT_OPT run "+bot.exRun+" finished in "+(T/1000).toFixed(3)+" s again - FASTER than "+(bot.exBestT/1000).toFixed(3)+" s and it repeats, keeping it");
+              X.bits=bot.exCand; bot.exBestT=T; bot.exBestCps=bot.exCps.slice();
+              X.ps=bot.exTraj.slice(); X.pm=new Map(); for(const p of X.ps) X.pm.set(p[0],p);
+              post({type:"exact_save",lesson:LESSON_KEY,rle:exRle(X.bits,Math.min(X.n,T+100)),pos:X.ps,t:T,orle:X.origRle,opos:X.origPos});
+            } else console.log("PTBOT_OPT run "+bot.exRun+" finished in "+(T/1000).toFixed(3)+" s - not the same as before ("+(bot.exVerify.T/1000).toFixed(3)+" s), dropped");
+            bot.exVerify=null;
           } else if(T<bot.exBestT) {
-            console.log("PTBOT_OPT run "+bot.exRun+" finished in "+(T/1000).toFixed(3)+" s - FASTER than "+(bot.exBestT/1000).toFixed(3)+" s, keeping it");
-            X.bits=bot.exCand; bot.exBestT=T; bot.exBestCps=bot.exCps.slice();
-            X.ps=bot.exTraj.slice(); X.pm=new Map(); for(const p of X.ps) X.pm.set(p[0],p);
-            post({type:"exact_save",lesson:LESSON_KEY,rle:exRle(X.bits,Math.min(X.n,T+100)),pos:X.ps,t:T});
+            console.log("PTBOT_OPT run "+bot.exRun+" finished in "+(T/1000).toFixed(3)+" s - faster than "+(bot.exBestT/1000).toFixed(3)+" s, running it once more to check it repeats");
+            bot.exVerify={bits:bot.exCand,mut:bot.exMut,T:T};
           } else console.log("PTBOT_OPT run "+bot.exRun+" finished in "+(T/1000).toFixed(3)+" s - not faster, dropped");
         }
         if(!bot.exRs) { bot.exRs=true; post({type:"restart",delay:1500}); }
@@ -1650,12 +1666,12 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
             bot.exactN=(bot.exactN||0)+1;
             if(bot.exactN%50===1 && (bot.exactLogs=(bot.exactLogs||0)+1)<=12) console.log("PTBOT_EXACT f"+state.frames+" off-path="+d.toFixed(2)+"m speed="+Math.round(state.speedKmh));
             if(d>tol) {
-              if(mutating) exAbort("the car left the replay's path ("+d.toFixed(1)+" m)");
+              if(mutating || bot.exControl) exAbort("the car left the replay's path ("+d.toFixed(1)+" m)");
               else { bot.exactOff=true; console.log("PTBOT_EXACT left the replay's path at frame "+state.frames+" ("+d.toFixed(1)+" m off the path), the bot takes over"); }
             }
           }
         }
-        if(mutating && !bot.exAbort) {
+        if((mutating || bot.exControl) && !bot.exAbort) {
           const cpi=state.nextCheckpointIndex||0;
           if(cpi!==bot.exLastCp) {
             bot.exLastCp=cpi; bot.exCps[cpi]=state.frames;
@@ -1663,17 +1679,17 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
             if(bc!==undefined && state.frames>bc+150) exAbort("behind the best run at checkpoint "+cpi+" by "+(state.frames-bc)+" ms");
           }
           if(state.finishFrames===null && state.frames>bot.exBestT+10) exAbort("not going to beat "+(bot.exBestT/1000).toFixed(3)+" s");
-        } else if(!mutating) {
+        } else if(!mutating && !bot.exControl) {
           const cpi=state.nextCheckpointIndex||0;
           if(cpi!==bot.exLastCp) { bot.exLastCp=cpi; bot.exCps[cpi]=state.frames; }
         }
         if(!bot.exactOff) {
-          const fi=Math.min(X.n-1,state.frames);
+          const fi=Math.min(X.n-1,stepNo);
           const b=bits[fi];
           return {up:!!(b&1),right:!!(b&2),down:!!(b&4),left:!!(b&8),reset:!!(b&16)};
         }
       } else if(!bot.exactOff && bot.exAbort) {
-        const b=bits[Math.min(X.n-1,state.frames)];
+        const b=bits[Math.min(X.n-1,stepNo)];
         return {up:!!(b&1),right:!!(b&2),down:!!(b&4),left:!!(b&8),reset:false};
       }
     }
@@ -2170,7 +2186,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       f=g;
     }
     const ps=d.pos.slice().sort((a,b)=>a[0]-b[0]);
-    bot.exact={bits:bits,pm:pm,ps:ps,n:n,rs:rs,rl:rl}; bot.exactOff=false; bot.exCur=undefined; bot.exTried=0; bot.exBestV=0; bot.exStart=undefined; bot.exRun=0; bot.exBestCps=[]; bot.exBestT=(typeof d.t==="number" && d.t>0) ? d.t : Infinity;
+    bot.exact={bits:bits,pm:pm,ps:ps,n:n,rs:rs,rl:rl,origRle:(Array.isArray(d.orle)&&d.orle.length)?d.orle:d.rle,origPos:(Array.isArray(d.opos)&&d.opos.length)?d.opos:d.pos}; bot.exactOff=false; bot.exCur=undefined; bot.exTried=0; bot.exBestV=0; bot.exStart=undefined; bot.exRun=0; bot.exBestCps=[]; bot.exVerify=null; bot.exCtlFail=0; bot.exBestT=(typeof d.t==="number" && d.t>0) ? d.t : Infinity;
     console.log("PTBOT_EXACT ready: "+n+" frames ("+(n/1000).toFixed(2)+" s) of exact replay buttons for this track");
   }
   function saveExact(samples) {
@@ -2178,7 +2194,16 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     const d=buildExact(samples,bot.recCtl||[]);
     if(!d) { console.log("PTBOT_EXACT not saved (the replay has to be recorded from its very start)"); return; }
     setExact(d);
-    post({type:"exact_save",lesson:LESSON_KEY,rle:d.rle,pos:d.pos});
+    post({type:"exact_save",lesson:LESSON_KEY,rle:d.rle,pos:d.pos,orle:d.rle,opos:d.pos});
+  }
+  function exRevert(why) {
+    const X=bot.exact; if(!X) return;
+    let n=0; for(const r of X.origRle) n+=r[1];
+    const bits=new Uint8Array(n); let k=0; for(const r of X.origRle) for(let j=0;j<r[1];j++) bits[k++]=r[0];
+    X.bits=bits; X.n=n; X.ps=X.origPos.slice().sort((a,b)=>a[0]-b[0]); X.pm=new Map(); for(const p of X.ps) X.pm.set(p[0],p);
+    bot.exBestT=Infinity; bot.exBestCps=[]; bot.exVerify=null; bot.exCtlFail=0;
+    console.log("PTBOT_OPT going back to the original replay ("+why+")");
+    post({type:"exact_save",lesson:LESSON_KEY,rle:X.origRle,pos:X.origPos,t:0,orle:X.origRle,opos:X.origPos});
   }
   function setRec(on) {
     if(on===bot.recOn) return;
@@ -2698,7 +2723,7 @@ function setupMainThread() {
       } catch (_) {}
       try {
         const ex=localStorage.getItem(exactKey(m.lesson));
-        if(ex) { const d=JSON.parse(ex); ch.postMessage({type:"exact",lesson:m.lesson||null,rle:d.rle,pos:d.pos,t:d.t}); }
+        if(ex) { const d=JSON.parse(ex); ch.postMessage({type:"exact",lesson:m.lesson||null,rle:d.rle,pos:d.pos,t:d.t,orle:d.orle,opos:d.opos}); }
       } catch (_) {}
       try {
         const d=localStorage.getItem(storeKey(m.track));
@@ -2706,7 +2731,7 @@ function setupMainThread() {
       } catch (_) {}
     } else if(m.type==="exact_save") {
       try {
-        if(m.rle&&m.rle.length) { localStorage.setItem(exactKey(m.lesson),JSON.stringify({rle:m.rle,pos:m.pos,t:m.t})); console.log("PTBOT_EXACT the page saved the exact replay for this track"); } else localStorage.removeItem(exactKey(m.lesson));
+        if(m.rle&&m.rle.length) { localStorage.setItem(exactKey(m.lesson),JSON.stringify({rle:m.rle,pos:m.pos,t:m.t,orle:m.orle,opos:m.opos})); console.log("PTBOT_EXACT the page saved the exact replay for this track"); } else localStorage.removeItem(exactKey(m.lesson));
       } catch (_) {}
     } else if(m.type==="patches_save") {
       try {
@@ -2762,7 +2787,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.1.1";
+    this.modVersion="1.1.2";
     this.touchingPhysics=true;
   }
 
