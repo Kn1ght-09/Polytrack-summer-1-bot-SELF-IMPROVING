@@ -1584,7 +1584,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     if(bot.noRoute) return {up:true,right:false,down:false,left:false,reset:false};
 
     if(EXACT_REPLAY && bot.exact && !bot.recOn) {
-      if(state.frames<bot.exactLastF) bot.exactOff=false;
+      if(state.frames<bot.exactLastF) { bot.exactOff=false; bot.exactN=0; bot.exactLogs=0; }
       bot.exactLastF=state.frames;
       const X=bot.exact;
       if(!bot.exactOff && state.frames<X.n) {
@@ -1592,6 +1592,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
           const p=X.pm.get(state.frames);
           if(p) {
             const d=Math.hypot(state.position.x-p[1],state.position.y-p[2],state.position.z-p[3]);
+            bot.exactN=(bot.exactN||0)+1;
+            if(state.frames<=state.frames && (bot.exactN%25===1 || d>0.8) && (bot.exactLogs=(bot.exactLogs||0)+1)<=60) console.log("PTBOT_EXACT f"+state.frames+" off="+d.toFixed(2)+"m speed="+Math.round(state.speedKmh)+" replay="+Math.round(p[4]||0)+" air="+(state.wheels===0?"y":"n"));
             if(d>EXACT_TOL) { bot.exactOff=true; console.log("PTBOT_EXACT left the replay's path at frame "+state.frames+" ("+d.toFixed(1)+" m off), the bot takes over"); }
           }
         }
@@ -2068,7 +2070,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     const rle=[]; let prev=-1,cnt=0;
     for(let f=0;f<end;f++) { const b=ctl[f]===undefined?(prev<0?1:prev):ctl[f]; if(b===prev) cnt++; else { if(cnt) rle.push([prev,cnt]); prev=b; cnt=1; } }
     if(cnt) rle.push([prev,cnt]);
-    return {rle:rle,pos:s.map(a=>[a[0],a[1],a[2],a[3]])};
+    return {rle:rle,pos:s.map(a=>[a[0],a[1],a[2],a[3],a[8]])};
   }
   function setExact(d) {
     if(!d || !Array.isArray(d.rle) || !Array.isArray(d.pos) || !d.rle.length) { bot.exact=null; return; }
@@ -2668,7 +2670,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.0.6";
+    this.modVersion="1.0.7";
     this.touchingPhysics=true;
   }
 
