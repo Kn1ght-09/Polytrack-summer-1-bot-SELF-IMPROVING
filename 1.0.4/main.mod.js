@@ -2326,6 +2326,11 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
 `;
 
 const BOT_BODY = `
+  if (globalThis.__ptTutorialBot && globalThis.__ptTutorialBot.recOn) {
+    const __pd = globalThis.__ptTutorialBot;
+    __pd.dbgN=(__pd.dbgN||0)+1;
+    if(__pd.dbgN%400===1 && (__pd.dbgLogs=(__pd.dbgLogs||0)+1)<=12) console.log("PTBOT_RECDBG car id="+e.id+" player="+(e.userControls?"yes":"no")+" started="+e.hasStarted+" frames="+e.frames+" samples="+__pd.recS.length);
+  }
   if (!e.userControls && globalThis.__ptTutorialBot && globalThis.__ptTutorialBot.recOn) {
     const __pb = globalThis.__ptTutorialBot;
     try {
@@ -2603,7 +2608,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.0.3";
+    this.modVersion="1.0.4";
     this.touchingPhysics=true;
   }
 
