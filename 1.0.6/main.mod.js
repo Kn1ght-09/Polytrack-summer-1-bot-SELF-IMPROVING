@@ -42,6 +42,8 @@ const THR_BIG = 15;   // km/h over: acts immediately
 const LIFT_MS = 80;  // too fast for this long (ms) before lifting
 const BRAKE_MS = 40;  // too fast for this long (ms) before braking
 const CURV_DEAD = 0.03; // tiny wobbles in the line (under this many radians per point) don't count as a corner, so the bot stops slowing down in straight corridors
+const EXACT_REPLAY = true; // a replay you teach (O while a replay plays) is also stored frame by frame; the bot presses exactly those buttons from the start, and only takes over if the car leaves the replay's path
+const EXACT_TOL = 2.5; // metres off the replay's path before the bot takes over
 const TAP_MS = 80;   // tapping: steering is pressed in short taps of this many ms instead of a blur of 1 ms presses (0 = off). Hard turns are still held.
 const TAP_HOLD = 0.9; // steering stronger than this is held down instead of tapped
 const NOTRIAL_NY = 0.85; // no random line/speed trials where the surface is steeper than this (1 = flat, 0 = vertical wall). 0.85 is about 32 degrees
@@ -998,6 +1000,7 @@ const WORKER_HELPERS = `
   const BEHIND_MS = ${BEHIND_MS};
   const NOTRIAL_NY = ${NOTRIAL_NY};
   const TAP_MS = ${TAP_MS}, TAP_HOLD = ${TAP_HOLD};
+  const EXACT_REPLAY = ${EXACT_REPLAY}, EXACT_TOL = ${EXACT_TOL};
   const REPLAY = ${REPLAY}, REPLAY_FF = ${REPLAY_FF};
   const LINE_PULL = ${LINE_PULL};
   const LOW_SPEED_BOOST = ${LOW_SPEED_BOOST};
@@ -1476,7 +1479,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       }
       if(m.type==="rec") { try { setRec(!!m.on); } catch(_) {} return; }
       if(m.type==="patches" && (m.lesson||null)===(LESSON_KEY||null)) { try { loadLessons(m.list); } catch(err) { console.log("PTBOT_LESSON load failed: "+String(err)); } return; }
-      if(m.type==="clearPatches") { try { clearLessons(); } catch(_) {} return; }
+      if(m.type==="exact" && (m.lesson||null)===(LESSON_KEY||null)) { try { setExact(m); } catch(err) { console.log("PTBOT_EXACT load failed: "+String(err)); } return; }
+      if(m.type==="clearPatches") { try { clearLessons(); bot.exact=null; post({type:"exact_save",lesson:LESSON_KEY,rle:[],pos:[]}); } catch(_) {} return; }
       if(m.type==="load" && (m.track||null)===(TRACK_ID||null) && m.data && m.data.n===N && m.data.best &&
          Array.isArray(m.data.best.gt) && Array.isArray(m.data.best.spd) &&
          Array.isArray(m.data.best.offs) && m.data.best.offs.length===N &&
@@ -1579,6 +1583,21 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     if(!state) return {up:true,right:false,down:false,left:false,reset:false};
     if(bot.noRoute) return {up:true,right:false,down:false,left:false,reset:false};
 
+    if(EXACT_REPLAY && bot.exact && !bot.recOn) {
+      if(state.frames<bot.exactLastF) bot.exactOff=false;
+      bot.exactLastF=state.frames;
+      const X=bot.exact;
+      if(!bot.exactOff && state.frames<X.n) {
+        if(state.frames%20===0) {
+          const p=X.pm.get(state.frames);
+          if(p) {
+            const d=Math.hypot(state.position.x-p[1],state.position.y-p[2],state.position.z-p[3]);
+            if(d>EXACT_TOL) { bot.exactOff=true; console.log("PTBOT_EXACT left the replay's path at frame "+state.frames+" ("+d.toFixed(1)+" m off), the bot takes over"); }
+          }
+        }
+        if(!bot.exactOff) { const b=X.bits[state.frames]; return {up:!!(b&1),right:!!(b&2),down:!!(b&4),left:!!(b&8),reset:!!(b&16)}; }
+      }
+    }
     const lf=bot.lastFrames[id];
     if(lf===undefined || state.frames<lf) {
       bot.idx[id]=0;
@@ -2026,8 +2045,10 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
   bot.recOn=false; bot.recS=[]; bot.recLast=-1;
   function sample(state,ctl,id) {
     if(!state || !state.hasStarted) return;
-    if(state.frames<bot.recLast) bot.recS.push([-1]);
+    if(state.frames<bot.recLast) { bot.recS.push([-1]); bot.recCtl=[]; }
     bot.recLast=state.frames;
+    if(!bot.recCtl) bot.recCtl=[];
+    if(bot.recCtl.length<60000) bot.recCtl[state.frames]=(ctl&&ctl.up?1:0)|(ctl&&ctl.right?2:0)|(ctl&&ctl.down?4:0)|(ctl&&ctl.left?8:0)|(ctl&&ctl.reset?16:0);
     if(state.frames%20!==0) return;
     if(bot.recS.length>40000) return;
     const q=state.quaternion, p=state.position;
@@ -2036,14 +2057,44 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       Math.round(state.speedKmh*10)/10,state.wheels,
       (ctl&&ctl.up?1:0)|(ctl&&ctl.right?2:0)|(ctl&&ctl.down?4:0)|(ctl&&ctl.left?8:0),state.nextCheckpointIndex]);
   }
+  // ---- EXACT REPLAY: the replay's own buttons, frame by frame ----
+  bot.exact=null; bot.exactOff=false; bot.exactLastF=-1;
+  function buildExact(samples,ctl) {
+    let cut=-1;
+    for(let i=0;i<samples.length;i++) if(samples[i].length===1) cut=i;
+    const s=samples.slice(cut+1);
+    if(s.length<8 || s[0][0]>40) return null;
+    let end=ctl.length; while(end>0 && ctl[end-1]===undefined) end--;
+    const rle=[]; let prev=-1,cnt=0;
+    for(let f=0;f<end;f++) { const b=ctl[f]===undefined?(prev<0?1:prev):ctl[f]; if(b===prev) cnt++; else { if(cnt) rle.push([prev,cnt]); prev=b; cnt=1; } }
+    if(cnt) rle.push([prev,cnt]);
+    return {rle:rle,pos:s.map(a=>[a[0],a[1],a[2],a[3]])};
+  }
+  function setExact(d) {
+    if(!d || !Array.isArray(d.rle) || !Array.isArray(d.pos) || !d.rle.length) { bot.exact=null; return; }
+    let n=0; for(const r of d.rle) n+=r[1];
+    const bits=new Uint8Array(n); let k=0;
+    for(const r of d.rle) for(let j=0;j<r[1];j++) bits[k++]=r[0];
+    const pm=new Map(); for(const p of d.pos) pm.set(p[0],p);
+    bot.exact={bits:bits,pm:pm,n:n}; bot.exactOff=false;
+    console.log("PTBOT_EXACT ready: "+n+" frames ("+(n/1000).toFixed(2)+" s) of exact replay buttons for this track");
+  }
+  function saveExact(samples) {
+    if(!EXACT_REPLAY || !bot.recReplay) return;
+    const d=buildExact(samples,bot.recCtl||[]);
+    if(!d) { console.log("PTBOT_EXACT not saved (the replay has to be recorded from its very start)"); return; }
+    setExact(d);
+    post({type:"exact_save",lesson:LESSON_KEY,rle:d.rle,pos:d.pos});
+  }
   function setRec(on) {
     if(on===bot.recOn) return;
     bot.recOn=on;
-    if(on) { bot.recS=[]; bot.recLast=-1; bot.enabled=false; bot.repId=null; bot.repLog=0; console.log("PTBOT_REC started - you drive now"); }
+    if(on) { bot.recS=[]; bot.recLast=-1; bot.enabled=false; bot.repId=null; bot.repLog=0; bot.recCtl=[]; bot.recReplay=false; console.log("PTBOT_REC started - you drive now"); }
     else {
       bot.enabled=true;
       console.log("PTBOT_REC stopped, "+bot.recS.length+" samples");
       const samples=bot.recS; bot.recS=[];
+      try { saveExact(samples); } catch(err) { console.log("PTBOT_EXACT save failed: "+String(err)); }
       post({type:"drive",track:TRACK_ID,samples:samples});
       try { learnLesson(samples); } catch(err) { console.log("PTBOT_LESSON failed: "+String(err)); }
     }
@@ -2338,7 +2389,7 @@ const BOT_BODY = `
       const __buf = new Uint8Array(t.HEAPU8.buffer, i, 227).slice();
       const __st = __pb.decode(__buf.buffer);
       if(__pb.repId===undefined || __pb.repId===null) __pb.repId=e.id;
-      if(e.id===__pb.repId) __pb.sample(__st,r,e.id);
+      if(e.id===__pb.repId) { __pb.recReplay=true; __pb.sample(__st,r,e.id); }
     } catch (_) {}
   }
   if (e.userControls && globalThis.__ptTutorialBot) {
@@ -2478,6 +2529,7 @@ function setupMainThread() {
   const PATCH_BASE="ptbot_patch_v1";
   let lastTrackKey=null;
   const patchKey=(t)=>PATCH_BASE+"_"+(t||"default");
+  const exactKey=(t)=>"ptbot_exact_v1_"+(t||"default");
   let lastLessonKey=null;
   const storeKey=(t)=>t?STORE_BASE+"_"+t:STORE_BASE;
 
@@ -2551,8 +2603,16 @@ function setupMainThread() {
         if(pl) { const list=JSON.parse(pl); console.log("PTBOT_LESSON the page found "+list.length+" saved lesson(s) for this track"); ch.postMessage({type:"patches",lesson:m.lesson||null,list:list}); }
       } catch (_) {}
       try {
+        const ex=localStorage.getItem(exactKey(m.lesson));
+        if(ex) { const d=JSON.parse(ex); ch.postMessage({type:"exact",lesson:m.lesson||null,rle:d.rle,pos:d.pos}); }
+      } catch (_) {}
+      try {
         const d=localStorage.getItem(storeKey(m.track));
         ch.postMessage({type:"load",track:m.track||null,data:d?JSON.parse(d):null});
+      } catch (_) {}
+    } else if(m.type==="exact_save") {
+      try {
+        if(m.rle&&m.rle.length) { localStorage.setItem(exactKey(m.lesson),JSON.stringify({rle:m.rle,pos:m.pos})); console.log("PTBOT_EXACT the page saved the exact replay for this track"); } else localStorage.removeItem(exactKey(m.lesson));
       } catch (_) {}
     } else if(m.type==="patches_save") {
       try {
@@ -2608,7 +2668,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.0.5";
+    this.modVersion="1.0.6";
     this.touchingPhysics=true;
   }
 
