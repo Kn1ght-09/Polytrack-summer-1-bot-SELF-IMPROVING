@@ -49,7 +49,8 @@ const REPLAY = true;   // on ramps, walls and slopes that you taught, the bot pr
 const REPLAY_FF = 0.6;   // how much of YOUR steering is added on top of the bot's own steering on ramps/walls (0 = bot steers alone, 1 = your full steering)
 const REPLAY_FIX = 0.25; // (old setting, not used any more)
 const BEHIND_MS = 1000; // restart a learning run when it is this many ms behind the best run's pace (part-way between checkpoints)
-const IGNORE_RECORDED_SPEED_CAP = true; // remove the taught/recorded speed ceiling; curvature, grip, and slow-zone limits still apply.
+const NO_BEND_CAP = true; // true = the bot's own bend speed guess (about 305 km/h) no longer holds it back on gentle bends; the measured grip limit (capG) still protects tight corners
+const IGNORE_RECORDED_SPEED_CAP = false; // true = the speed you drove in a lesson is NOT used as the bot's speed limit (only corner grip limits it). It can make the bot arrive at corners too fast.
 const FAR_W = 0;         // early aim: how much the bot leans toward where the line goes further ahead (0 = off)
 const FAR_SEC = 0.9;     // how many seconds ahead the early aim looks
 const C2_GRIP_FRAC = 1.2;  // corners are taken at no more than this fraction of the sideways grip the bot has measured
@@ -993,6 +994,7 @@ const WORKER_HELPERS = `
   const LAT_ACCEL = ${LAT_ACCEL};
   const CURV_DEAD = ${CURV_DEAD};
   const IGNORE_RECORDED_SPEED_CAP = ${IGNORE_RECORDED_SPEED_CAP};
+  const NO_BEND_CAP = ${NO_BEND_CAP};
   const BEHIND_MS = ${BEHIND_MS};
   const NOTRIAL_NY = ${NOTRIAL_NY};
   const TAP_MS = ${TAP_MS}, TAP_HOLD = ${TAP_HOLD};
@@ -1516,12 +1518,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       // points you taught: you already drove them at that speed, so the bot's own bend/grip guesses must not hold it below it
       // (they held it near 305 km/h where you did 400)
       const taught = ROUTE[j][8]!==undefined;
-      // Teaching supplies the route and steering lesson, not a hard speed cap when the option above is enabled.
-      // Keep the former lesson-speed behavior when disabled; when enabled, retain corner, grip, and slow-zone limits.
-      const taughtLineCap = ((HARD[j] || KAP[j]>0.003) ? SPD[j]/LESSON_SPEED : SPD[j])*SPEED_FACTOR;
-      const m = taught
-        ? (IGNORE_RECORDED_SPEED_CAP ? Math.min(CAP[j],zc,capG) : Math.min(taughtLineCap,zc))
-        : Math.min(routeCap,CAP[j],zc,capG);
+      // on ramps/walls the copied steering only fits YOUR speed, so there the bot does exactly your speed (no bonus)
+      const m = taught ? Math.min(((HARD[j] || KAP[j]>0.003) ? SPD[j]/LESSON_SPEED : SPD[j])*SPEED_FACTOR,zc) : Math.min(routeCap,NO_BEND_CAP?1000:CAP[j],zc,capG);
       const v=m+Pi.br*(j-i);
       if(v<best) { best=v; limW = m===zc ? "slow zone" : (m===capG ? "grip" : (taught ? "your lesson speed" : (m===CAP[j] ? "bend" : "line speed"))); limK=j-i; limM=m; }
     }
@@ -2595,7 +2593,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.0.1";
+    this.modVersion="1.0.2";
     this.touchingPhysics=true;
   }
 
