@@ -43,7 +43,8 @@ const LIFT_MS = 80;  // too fast for this long (ms) before lifting
 const BRAKE_MS = 40;  // too fast for this long (ms) before braking
 const CURV_DEAD = 0.03; // tiny wobbles in the line (under this many radians per point) don't count as a corner, so the bot stops slowing down in straight corridors
 const EXACT_REPLAY = true; // a replay you teach (O while a replay plays) is also stored frame by frame; the bot presses exactly those buttons from the start, and only takes over if the car leaves the replay's path
-const EXACT_TAP = true; // on later runs of an exact replay the bot tries fast tapping instead of long steering holds (skids less), keeps whichever finishes first
+const EXACT_OPT = true; // on a track with an exact replay the bot tries one tiny change per run (a press moved a few thousandths of a second earlier or later) and keeps it only if the run finishes faster
+const EXACT_TAP = false; // on later runs of an exact replay the bot tries fast tapping instead of long steering holds (skids less), keeps whichever finishes first
 const EXACT_TAP_RUN = 100; // only steering holds at least this many ms long are turned into taps
 const EXACT_TAP_TOL = 6; // metres off the replay's path allowed while a tap variant is being tried
 const EXACT_TOL = 2.5; // metres off the replay's path before the bot takes over
@@ -1004,6 +1005,7 @@ const WORKER_HELPERS = `
   const BEHIND_MS = ${BEHIND_MS};
   const NOTRIAL_NY = ${NOTRIAL_NY};
   const TAP_MS = ${TAP_MS}, TAP_HOLD = ${TAP_HOLD}, TIGHT_ON = ${TIGHT_ON}, TIGHT_OFF = ${TIGHT_OFF};
+  const EXACT_OPT = ${EXACT_OPT};
   const EXACT_REPLAY = ${EXACT_REPLAY}, EXACT_TOL = ${EXACT_TOL}, EXACT_TAP = ${EXACT_TAP}, EXACT_TAP_RUN = ${EXACT_TAP_RUN}, EXACT_TAP_TOL = ${EXACT_TAP_TOL};
   const EX_VARIANTS=[{on:0,off:0,name:"the replay as it was"},{on:8,off:2,name:"taps 8 on / 2 off"},{on:5,off:5,name:"taps 5 on / 5 off"},{on:12,off:3,name:"taps 12 on / 3 off"},{on:3,off:3,name:"taps 3 on / 3 off"},{on:6,off:2,name:"taps 6 on / 2 off"}];
   const REPLAY = ${REPLAY}, REPLAY_FF = ${REPLAY_FF};
@@ -1590,28 +1592,49 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
 
     if(EXACT_REPLAY && bot.exact && !bot.recOn) {
       const X=bot.exact;
-      if(bot.exCur===undefined || state.frames<bot.exactLastF) {
-        bot.exactOff=false; bot.exactN=0; bot.exactLogs=0; bot.exFin=false;
-        if(!EXACT_TAP) bot.exCur=0;
-        else if(bot.exTried<EX_VARIANTS.length) bot.exCur=bot.exTried++;
-        else bot.exCur=bot.exBestV;
-        console.log("PTBOT_EXACT this run: "+EX_VARIANTS[bot.exCur].name);
+      const exAbort=(why)=>{ if(!bot.exAbort) { bot.exAbort=true; console.log("PTBOT_OPT run "+bot.exRun+" stopped: "+why); } if(!bot.exRs) { bot.exRs=true; post({type:"restart",delay:300}); } };
+      if(bot.exStart===undefined || state.frames<bot.exactLastF) {
+        bot.exStart=true; bot.exactOff=false; bot.exFin=false; bot.exAbort=false; bot.exRs=false;
+        bot.exTraj=[]; bot.exCps=[]; bot.exLastCp=state.nextCheckpointIndex||0; bot.exactN=0; bot.exactLogs=0;
+        bot.exRun=(bot.exRun||0)+1; bot.exCand=null; bot.exMut=null;
+        if(EXACT_OPT && bot.exBestT<Infinity) {
+          const cand=X.bits.slice(), lim=Math.min(X.n,bot.exBestT+5);
+          let f=-1;
+          for(let tries=0;tries<80 && lim>10;tries++) { const g=1+Math.floor(Math.random()*(lim-2)); if(cand[g]!==cand[g-1] && ((cand[g]^cand[g-1])&~1)) { f=g; break; } }
+          if(f>0) {
+            const k=(1+Math.floor(Math.random()*4))*(Math.random()<0.5?-1:1);
+            if(k>0) { for(let h=f;h<Math.min(X.n,f+k);h++) cand[h]=X.bits[f-1]; }
+            else { for(let h=Math.max(0,f+k);h<f;h++) cand[h]=X.bits[f]; }
+            bot.exCand=cand; bot.exMut={f:f,k:k};
+          }
+        }
+        console.log("PTBOT_OPT run "+bot.exRun+": "+(bot.exMut ? "trying a press moved "+(bot.exMut.k>0?"later":"earlier")+" by "+Math.abs(bot.exMut.k)+" ms at "+(bot.exMut.f/1000).toFixed(2)+" s" : "the replay as it is")+(bot.exBestT<Infinity ? " (best so far "+(bot.exBestT/1000).toFixed(3)+" s)" : ""));
       }
       bot.exactLastF=state.frames;
-      const V=EX_VARIANTS[bot.exCur];
+      const bits=bot.exCand||X.bits;
+      const mutating=!!bot.exCand;
       if(!bot.exFin && state.finishFrames!==null) {
         bot.exFin=true;
-        if(!bot.exactOff) {
-          console.log("PTBOT_EXACT finished with "+V.name+": "+(state.finishFrames/1000).toFixed(3)+" s"+(state.finishFrames<bot.exBestT?" (new best)":""));
-          if(state.finishFrames<bot.exBestT) { bot.exBestT=state.finishFrames; bot.exBestV=bot.exCur; }
-        } else console.log("PTBOT_EXACT "+V.name+" left the path, not counted");
+        const T=state.finishFrames;
+        if(!bot.exactOff && !bot.exAbort) {
+          if(!mutating) {
+            if(T<bot.exBestT) { bot.exBestT=T; bot.exBestCps=bot.exCps.slice(); }
+            console.log("PTBOT_OPT run "+bot.exRun+" finished in "+(T/1000).toFixed(3)+" s (the replay to beat)");
+          } else if(T<bot.exBestT) {
+            console.log("PTBOT_OPT run "+bot.exRun+" finished in "+(T/1000).toFixed(3)+" s - FASTER than "+(bot.exBestT/1000).toFixed(3)+" s, keeping it");
+            X.bits=bot.exCand; bot.exBestT=T; bot.exBestCps=bot.exCps.slice();
+            X.ps=bot.exTraj.slice(); X.pm=new Map(); for(const p of X.ps) X.pm.set(p[0],p);
+            post({type:"exact_save",lesson:LESSON_KEY,rle:exRle(X.bits,Math.min(X.n,T+100)),pos:X.ps,t:T});
+          } else console.log("PTBOT_OPT run "+bot.exRun+" finished in "+(T/1000).toFixed(3)+" s - not faster, dropped");
+        }
+        if(!bot.exRs) { bot.exRs=true; post({type:"restart",delay:1500}); }
       }
-      if(!bot.exactOff && state.frames<X.n) {
-        const tol=V.on>0 ? EXACT_TAP_TOL : EXACT_TOL;
+      if(!bot.exactOff && !bot.exAbort && state.frames<X.n) {
+        const tol=EXACT_TOL;
         if(state.frames%20===0) {
+          bot.exTraj.push([state.frames,+state.position.x.toFixed(2),+state.position.y.toFixed(2),+state.position.z.toFixed(2),Math.round(state.speedKmh*10)/10]);
           const p=X.pm.get(state.frames);
           if(p) {
-            // distance from the replay's PATH (not from where the replay was at this moment), so being ahead of the record is fine
             const ps=X.ps, px=state.position.x, py=state.position.y, pz=state.position.z;
             const c=Math.round(state.frames/20);
             let d=1e9;
@@ -1624,20 +1647,34 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
               const dd=Math.hypot(px-(A[1]+vx*t),py-(A[2]+vy*t),pz-(A[3]+vz*t));
               if(dd<d) d=dd;
             }
-            const dClock=Math.hypot(px-p[1],py-p[2],pz-p[3]);
             bot.exactN=(bot.exactN||0)+1;
-            if((bot.exactN%25===1) && (bot.exactLogs=(bot.exactLogs||0)+1)<=40) console.log("PTBOT_EXACT f"+state.frames+" off-path="+d.toFixed(2)+"m off-clock="+dClock.toFixed(1)+"m speed="+Math.round(state.speedKmh)+" replay="+Math.round(p[4]||0)+" air="+(state.wheels===0?"y":"n"));
-            if(d>tol) { bot.exactOff=true; console.log("PTBOT_EXACT left the replay's path at frame "+state.frames+" ("+d.toFixed(1)+" m off the path), the bot takes over"); }
+            if(bot.exactN%50===1 && (bot.exactLogs=(bot.exactLogs||0)+1)<=12) console.log("PTBOT_EXACT f"+state.frames+" off-path="+d.toFixed(2)+"m speed="+Math.round(state.speedKmh));
+            if(d>tol) {
+              if(mutating) exAbort("the car left the replay's path ("+d.toFixed(1)+" m)");
+              else { bot.exactOff=true; console.log("PTBOT_EXACT left the replay's path at frame "+state.frames+" ("+d.toFixed(1)+" m off the path), the bot takes over"); }
+            }
           }
+        }
+        if(mutating && !bot.exAbort) {
+          const cpi=state.nextCheckpointIndex||0;
+          if(cpi!==bot.exLastCp) {
+            bot.exLastCp=cpi; bot.exCps[cpi]=state.frames;
+            const bc=bot.exBestCps[cpi];
+            if(bc!==undefined && state.frames>bc+150) exAbort("behind the best run at checkpoint "+cpi+" by "+(state.frames-bc)+" ms");
+          }
+          if(state.finishFrames===null && state.frames>bot.exBestT+10) exAbort("not going to beat "+(bot.exBestT/1000).toFixed(3)+" s");
+        } else if(!mutating) {
+          const cpi=state.nextCheckpointIndex||0;
+          if(cpi!==bot.exLastCp) { bot.exLastCp=cpi; bot.exCps[cpi]=state.frames; }
         }
         if(!bot.exactOff) {
-          let b=X.bits[state.frames];
-          if(V.on>0 && (b&10) && X.rl[state.frames]>=EXACT_TAP_RUN && state.wheels>0) {
-            const k=state.frames-X.rs[state.frames];
-            if(k%(V.on+V.off)>=V.on) b&=~10;
-          }
+          const fi=Math.min(X.n-1,state.frames);
+          const b=bits[fi];
           return {up:!!(b&1),right:!!(b&2),down:!!(b&4),left:!!(b&8),reset:!!(b&16)};
         }
+      } else if(!bot.exactOff && bot.exAbort) {
+        const b=bits[Math.min(X.n-1,state.frames)];
+        return {up:!!(b&1),right:!!(b&2),down:!!(b&4),left:!!(b&8),reset:false};
       }
     }
     const lf=bot.lastFrames[id];
@@ -2112,6 +2149,12 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     if(cnt) rle.push([prev,cnt]);
     return {rle:rle,pos:s.map(a=>[a[0],a[1],a[2],a[3],a[8]])};
   }
+  function exRle(bits,n) {
+    const rle=[]; let prev=-1,cnt=0;
+    for(let f=0;f<n;f++) { const b=bits[f]; if(b===prev) cnt++; else { if(cnt) rle.push([prev,cnt]); prev=b; cnt=1; } }
+    if(cnt) rle.push([prev,cnt]);
+    return rle;
+  }
   function setExact(d) {
     if(!d || !Array.isArray(d.rle) || !Array.isArray(d.pos) || !d.rle.length) { bot.exact=null; return; }
     let n=0; for(const r of d.rle) n+=r[1];
@@ -2127,7 +2170,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       f=g;
     }
     const ps=d.pos.slice().sort((a,b)=>a[0]-b[0]);
-    bot.exact={bits:bits,pm:pm,ps:ps,n:n,rs:rs,rl:rl}; bot.exactOff=false; bot.exCur=undefined; bot.exTried=0; bot.exBestT=Infinity; bot.exBestV=0;
+    bot.exact={bits:bits,pm:pm,ps:ps,n:n,rs:rs,rl:rl}; bot.exactOff=false; bot.exCur=undefined; bot.exTried=0; bot.exBestV=0; bot.exStart=undefined; bot.exRun=0; bot.exBestCps=[]; bot.exBestT=(typeof d.t==="number" && d.t>0) ? d.t : Infinity;
     console.log("PTBOT_EXACT ready: "+n+" frames ("+(n/1000).toFixed(2)+" s) of exact replay buttons for this track");
   }
   function saveExact(samples) {
@@ -2655,7 +2698,7 @@ function setupMainThread() {
       } catch (_) {}
       try {
         const ex=localStorage.getItem(exactKey(m.lesson));
-        if(ex) { const d=JSON.parse(ex); ch.postMessage({type:"exact",lesson:m.lesson||null,rle:d.rle,pos:d.pos}); }
+        if(ex) { const d=JSON.parse(ex); ch.postMessage({type:"exact",lesson:m.lesson||null,rle:d.rle,pos:d.pos,t:d.t}); }
       } catch (_) {}
       try {
         const d=localStorage.getItem(storeKey(m.track));
@@ -2663,7 +2706,7 @@ function setupMainThread() {
       } catch (_) {}
     } else if(m.type==="exact_save") {
       try {
-        if(m.rle&&m.rle.length) { localStorage.setItem(exactKey(m.lesson),JSON.stringify({rle:m.rle,pos:m.pos})); console.log("PTBOT_EXACT the page saved the exact replay for this track"); } else localStorage.removeItem(exactKey(m.lesson));
+        if(m.rle&&m.rle.length) { localStorage.setItem(exactKey(m.lesson),JSON.stringify({rle:m.rle,pos:m.pos,t:m.t})); console.log("PTBOT_EXACT the page saved the exact replay for this track"); } else localStorage.removeItem(exactKey(m.lesson));
       } catch (_) {}
     } else if(m.type==="patches_save") {
       try {
@@ -2719,7 +2762,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.1.0";
+    this.modVersion="1.1.1";
     this.touchingPhysics=true;
   }
 
