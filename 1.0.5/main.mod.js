@@ -2220,7 +2220,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       for(const p of m.trackParts) TRACK_LIB[p.id]={v:p.vertices,detector:p.detector||null,startOffset:p.startOffset||null};
       return;
     }
-    if(m.messageType===3 && typeof m.trackData==="string" && m.carRecording==null) {
+    if(m.messageType===3 && typeof m.trackData==="string") {
       console.log("PTBOT_TRACK worker saw the track ("+m.trackData.length+" characters), reading it");
       const track=Ko.fromSaveString(m.trackData);
       if(!track) { console.log("PTBOT_TRACK could not read the track"); return; }
@@ -2608,7 +2608,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.0.4";
+    this.modVersion="1.0.5";
     this.touchingPhysics=true;
   }
 
