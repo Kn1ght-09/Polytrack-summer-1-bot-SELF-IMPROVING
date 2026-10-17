@@ -1591,7 +1591,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
     if(EXACT_REPLAY && bot.exact && !bot.recOn) {
       const X=bot.exact;
       if(bot.exCur===undefined || state.frames<bot.exactLastF) {
-        bot.exactOff=false; bot.exactN=0; bot.exactLogs=0; bot.exFin=false;
+        bot.exactOff=false; bot.exactN=0; bot.exactLogs=0; bot.exFin=false; bot.exPtr=0; bot.exSi=0;
         if(!EXACT_TAP) bot.exCur=0;
         else if(bot.exTried<EX_VARIANTS.length) bot.exCur=bot.exTried++;
         else bot.exCur=bot.exBestV;
@@ -1606,22 +1606,34 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
           if(state.finishFrames<bot.exBestT) { bot.exBestT=state.finishFrames; bot.exBestV=bot.exCur; }
         } else console.log("PTBOT_EXACT "+V.name+" left the path, not counted");
       }
-      if(!bot.exactOff && state.frames<X.n) {
+      if(!bot.exactOff && bot.exPtr<X.n) {
         const tol=V.on>0 ? EXACT_TAP_TOL : EXACT_TOL;
-        if(state.frames%20===0) {
-          const p=X.pm.get(state.frames);
-          if(p) {
-            const d=Math.hypot(state.position.x-p[1],state.position.y-p[2],state.position.z-p[3]);
-            bot.exactN=(bot.exactN||0)+1;
-            if((bot.exactN%25===1 || d>0.8) && (bot.exactLogs=(bot.exactLogs||0)+1)<=40) console.log("PTBOT_EXACT f"+state.frames+" off="+d.toFixed(2)+"m speed="+Math.round(state.speedKmh)+" replay="+Math.round(p[4]||0)+" air="+(state.wheels===0?"y":"n"));
-            if(d>tol) { bot.exactOff=true; console.log("PTBOT_EXACT left the replay's path at frame "+state.frames+" ("+d.toFixed(1)+" m off), the bot takes over"); }
-          }
+        // where on the replay's path is the car now? (works even when the car is ahead of or behind the replay's clock)
+        const ps=X.ps, px=state.position.x, py=state.position.y, pz=state.position.z;
+        let bestD=1e9, bestPtr=bot.exPtr;
+        const s0=Math.max(0,bot.exSi-2), s1=Math.min(ps.length-2,bot.exSi+14);
+        let bestI=bot.exSi;
+        for(let i=s0;i<=s1;i++) {
+          const A=ps[i], B=ps[i+1];
+          const vx=B[1]-A[1], vy=B[2]-A[2], vz=B[3]-A[3];
+          const L2=vx*vx+vy*vy+vz*vz;
+          let t=L2>1e-9 ? ((px-A[1])*vx+(py-A[2])*vy+(pz-A[3])*vz)/L2 : 0;
+          t=Math.max(0,Math.min(1,t));
+          const dx=px-(A[1]+vx*t), dy=py-(A[2]+vy*t), dz=pz-(A[3]+vz*t);
+          const d=Math.sqrt(dx*dx+dy*dy+dz*dz);
+          if(d<bestD) { bestD=d; bestI=i; bestPtr=A[0]+(B[0]-A[0])*t; }
         }
+        bot.exSi=bestI;
+        if(state.frames<2500 && bestPtr<state.frames+60 && state.speedKmh<40) bot.exPtr=Math.max(bot.exPtr+1,state.frames); // still on the start: follow the clock
+        else bot.exPtr=Math.max(bot.exPtr+0.2,bestPtr);
+        bot.exactN=(bot.exactN||0)+1;
+        if(state.frames%500===0 && (bot.exactLogs=(bot.exactLogs||0)+1)<=40) console.log("PTBOT_EXACT f"+state.frames+" replay-frame "+Math.round(bot.exPtr)+" off="+bestD.toFixed(2)+"m speed="+Math.round(state.speedKmh)+" air="+(state.wheels===0?"y":"n"));
+        if(bestD>tol) { bot.exactOff=true; console.log("PTBOT_EXACT left the replay's path at frame "+state.frames+" ("+bestD.toFixed(1)+" m off the path), the bot takes over"); }
         if(!bot.exactOff) {
-          let b=X.bits[state.frames];
-          if(V.on>0 && (b&10) && X.rl[state.frames]>=EXACT_TAP_RUN && state.wheels>0) {
-            const k=state.frames-X.rs[state.frames];
-            if(k%(V.on+V.off)>=V.on) b&=~10;
+          const fi=Math.min(X.n-1,Math.floor(bot.exPtr));
+          let b=X.bits[fi];
+          if(V.on>0 && (b&10) && X.rl[fi]>=EXACT_TAP_RUN && state.wheels>0) {
+            if(state.frames%(V.on+V.off)>=V.on) b&=~10;
           }
           return {up:!!(b&1),right:!!(b&2),down:!!(b&4),left:!!(b&8),reset:!!(b&16)};
         }
@@ -2113,7 +2125,8 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       for(let h=f;h<g;h++) { rs[h]=f; rl[h]=g-f; }
       f=g;
     }
-    bot.exact={bits:bits,pm:pm,n:n,rs:rs,rl:rl}; bot.exactOff=false; bot.exCur=undefined; bot.exTried=0; bot.exBestT=Infinity; bot.exBestV=0;
+    const ps=d.pos.slice().sort((a,b)=>a[0]-b[0]);
+    bot.exact={bits:bits,pm:pm,ps:ps,n:n,rs:rs,rl:rl}; bot.exactOff=false; bot.exCur=undefined; bot.exTried=0; bot.exBestT=Infinity; bot.exBestV=0;
     console.log("PTBOT_EXACT ready: "+n+" frames ("+(n/1000).toFixed(2)+" s) of exact replay buttons for this track");
   }
   function saveExact(samples) {
@@ -2705,7 +2718,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.0.8";
+    this.modVersion="1.0.9";
     this.touchingPhysics=true;
   }
 
