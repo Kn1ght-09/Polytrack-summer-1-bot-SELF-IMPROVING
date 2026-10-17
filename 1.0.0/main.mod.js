@@ -42,6 +42,9 @@ const THR_BIG = 15;   // km/h over: acts immediately
 const LIFT_MS = 80;  // too fast for this long (ms) before lifting
 const BRAKE_MS = 40;  // too fast for this long (ms) before braking
 const CURV_DEAD = 0.03; // tiny wobbles in the line (under this many radians per point) don't count as a corner, so the bot stops slowing down in straight corridors
+const TAP_MS = 80;   // tapping: steering is pressed in short taps of this many ms instead of a blur of 1 ms presses (0 = off). Hard turns are still held.
+const TAP_HOLD = 0.9; // steering stronger than this is held down instead of tapped
+const NOTRIAL_NY = 0.85; // no random line/speed trials where the surface is steeper than this (1 = flat, 0 = vertical wall). 0.85 is about 32 degrees
 const REPLAY = true;   // on ramps, walls and slopes that you taught, the bot presses what YOU pressed there (kept in step with where the car is)
 const REPLAY_FF = 0.6;   // how much of YOUR steering is added on top of the bot's own steering on ramps/walls (0 = bot steers alone, 1 = your full steering)
 const REPLAY_FIX = 0.25; // (old setting, not used any more)
@@ -991,6 +994,8 @@ const WORKER_HELPERS = `
   const CURV_DEAD = ${CURV_DEAD};
   const IGNORE_RECORDED_SPEED_CAP = ${IGNORE_RECORDED_SPEED_CAP};
   const BEHIND_MS = ${BEHIND_MS};
+  const NOTRIAL_NY = ${NOTRIAL_NY};
+  const TAP_MS = ${TAP_MS}, TAP_HOLD = ${TAP_HOLD};
   const REPLAY = ${REPLAY}, REPLAY_FF = ${REPLAY_FF};
   const LINE_PULL = ${LINE_PULL};
   const LOW_SPEED_BOOST = ${LOW_SPEED_BOOST};
@@ -1040,6 +1045,8 @@ const WORKER_HELPERS = `
     lastPitch: Object.create(null),
     airMatched: Object.create(null),
     finLogged: Object.create(null),
+    tapUntil: Object.create(null), tapDir: Object.create(null), tapEnd: Object.create(null),
+    over: Object.create(null), overF: Object.create(null),
     dbg: null,
     recRun: 0,
     recChunk: [],
@@ -1240,13 +1247,22 @@ const WORKER_HELPERS = `
     return L.cur.seg[segOf(i)] || DEF;
   }
 
+  // the learner tries small random line/speed changes to find a faster way; never on walls and steep slopes
+  function noTrial(k) {
+    k=Math.max(0,Math.min(N-1,k));
+    for(let j=Math.max(0,k-2);j<=Math.min(N-1,k+2);j++) {
+      const p=ROUTE[j];
+      if(p[5]!==undefined && p[5]<NOTRIAL_NY) return true;
+    }
+    return false;
+  }
   function offAt(k) {
-    if(!LEARN) return 0;
+    if(!LEARN || noTrial(k)) return 0;
     return L.cur.offs[Math.max(0,Math.min(N-1,k))] || 0;
   }
 
   function spdAt(k) {
-    if(!LEARN) return 0;
+    if(!LEARN || noTrial(k)) return 0;
     return L.cur.spd[Math.max(0,Math.min(N-1,k))] || 0;
   }
 
@@ -1800,11 +1816,32 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       if(bot.ring.length>40) bot.ring.shift();
     }
 
-    let e=(bot.acc[id]??0)+s;
     let right=false,left=false;
-    if(e>=1) { right=true;e-=1; }
-    else if(e<=-1) { left=true;e+=1; }
-    bot.acc[id]=e;
+    if(TAP_MS>0 && useC2 && !bot.replaying) {
+      // tapping: a tap of TAP_MS, then a gap sized so the average steering matches what is wanted
+      const a=Math.abs(s), dir=s>0?1:-1;
+      const nowF=state.frames;
+      let until=bot.tapUntil[id]??-1, dirOld=bot.tapDir[id]??0, endF=bot.tapEnd[id]??-1e9;
+      if(nowF<until) {
+        if(dirOld>0) right=true; else left=true;
+        if(a<0.04) { bot.tapUntil[id]=nowF; bot.tapEnd[id]=nowF; }
+      } else if(a>=TAP_HOLD) {
+        if(dir>0) right=true; else left=true;
+        bot.tapDir[id]=dir; bot.tapEnd[id]=nowF;
+      } else if(a>=0.06) {
+        const gap=TAP_MS*(1/a-1);
+        if(dir!==dirOld || nowF-endF>=gap) {
+          bot.tapUntil[id]=nowF+TAP_MS; bot.tapDir[id]=dir; bot.tapEnd[id]=nowF+TAP_MS;
+          if(dir>0) right=true; else left=true;
+        }
+      }
+      bot.acc[id]=0;
+    } else {
+      let e=(bot.acc[id]??0)+s;
+      if(e>=1) { right=true;e-=1; }
+      else if(e<=-1) { left=true;e+=1; }
+      bot.acc[id]=e;
+    }
 
     let reset=false;
     const lp=bot.lastPos[id];
@@ -2133,7 +2170,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
 
   // ---- ROUTE SWITCHING ----
   const PER_CAR=["idx","acc","stuck","lastPos","lastFrames","hist","lastCrash","lastOff","lastCp","airSince","airV0",
-    "lastAirborne","keepSpeed","keepUntil","lastLand","lastBrakeLog","landSteerUntil","lastPitch","airMatched","finLogged","c2","over","overF"];
+    "lastAirborne","keepSpeed","keepUntil","lastLand","lastBrakeLog","landSteerUntil","lastPitch","airMatched","finLogged","c2","over","overF","tapUntil","tapDir","tapEnd"];
   function smoothRoute(route) {
     const n=route.length;
     if(!(SMOOTH_SHIFT>0) || n<5) return route;
@@ -2554,7 +2591,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="0.9.3";
+    this.modVersion="1.0.0";
     this.touchingPhysics=true;
   }
 
