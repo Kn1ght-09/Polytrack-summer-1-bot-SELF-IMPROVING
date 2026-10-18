@@ -1627,7 +1627,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
       if(stepNo>2 && stepNo!==state.frames && (bot.exMis=(bot.exMis||0)+1)<=6) console.log("PTBOT_EXACT clock mismatch: game frame "+state.frames+" but this is step "+stepNo+" of the run");
       const bits=bot.exCand||X.bits;
       const mutating=!!bot.exCand;
-      if(!bot.exFin && state.finishFrames!==null) {
+      if(!bot.exFin && stepNo>200 && state.finishFrames!==null) {
         bot.exFin=true;
         const T=state.finishFrames;
         if(!bot.exactOff && !bot.exAbort) {
@@ -2810,7 +2810,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.1.5";
+    this.modVersion="1.1.6";
     this.touchingPhysics=true;
   }
 
