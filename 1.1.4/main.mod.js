@@ -2787,7 +2787,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.1.3";
+    this.modVersion="1.1.4";
     this.touchingPhysics=true;
   }
 
