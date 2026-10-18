@@ -47,7 +47,8 @@ const EXACT_OPT = true; // on a track with an exact replay the bot tries one tin
 const EXACT_TAP = false; // on later runs of an exact replay the bot tries fast tapping instead of long steering holds (skids less), keeps whichever finishes first
 const EXACT_TAP_RUN = 100; // only steering holds at least this many ms long are turned into taps
 const EXACT_TAP_TOL = 6; // metres off the replay's path allowed while a tap variant is being tried
-const EXACT_TOL = 2.5; // metres off the replay's path before the bot takes over
+const EXACT_TOL = 2.5;
+const EXACT_OPT_TOL = 12; // while trying a change, how far (m) the car may be from the replay's path before the run is stopped (a change that works can put the car ahead of or beside the old line) // metres off the replay's path before the bot takes over
 const TIGHT_ON = 9, TIGHT_OFF = 1; // hard turns (steering above TAP_HOLD) are pressed as fast taps of this many ms on / off instead of one long hold, so the car turns without skidding. TIGHT_OFF = 0 goes back to holding.
 const TAP_MS = 80;   // tapping: steering is pressed in short taps of this many ms instead of a blur of 1 ms presses (0 = off). Hard turns are still held.
 const TAP_HOLD = 0.9; // steering stronger than this is held down instead of tapped
@@ -1006,7 +1007,7 @@ const WORKER_HELPERS = `
   const NOTRIAL_NY = ${NOTRIAL_NY};
   const TAP_MS = ${TAP_MS}, TAP_HOLD = ${TAP_HOLD}, TIGHT_ON = ${TIGHT_ON}, TIGHT_OFF = ${TIGHT_OFF};
   let EXACT_OPT = ${EXACT_OPT};
-  const EXACT_REPLAY = ${EXACT_REPLAY}, EXACT_TOL = ${EXACT_TOL}, EXACT_TAP = ${EXACT_TAP}, EXACT_TAP_RUN = ${EXACT_TAP_RUN}, EXACT_TAP_TOL = ${EXACT_TAP_TOL};
+  const EXACT_REPLAY = ${EXACT_REPLAY}, EXACT_TOL = ${EXACT_TOL}, EXACT_OPT_TOL = ${EXACT_OPT_TOL}, EXACT_TAP = ${EXACT_TAP}, EXACT_TAP_RUN = ${EXACT_TAP_RUN}, EXACT_TAP_TOL = ${EXACT_TAP_TOL};
   const EX_VARIANTS=[{on:0,off:0,name:"the replay as it was"},{on:8,off:2,name:"taps 8 on / 2 off"},{on:5,off:5,name:"taps 5 on / 5 off"},{on:12,off:3,name:"taps 12 on / 3 off"},{on:3,off:3,name:"taps 3 on / 3 off"},{on:6,off:2,name:"taps 6 on / 2 off"}];
   const REPLAY = ${REPLAY}, REPLAY_FF = ${REPLAY_FF};
   const LINE_PULL = ${LINE_PULL};
@@ -1654,7 +1655,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
         if(!bot.exRs) { bot.exRs=true; post({type:"restart",delay:1500}); }
       }
       if(!bot.exactOff && !bot.exAbort && stepNo<X.n) {
-        const tol=EXACT_TOL;
+        const tol=(mutating && !bot.exControl) ? EXACT_OPT_TOL : EXACT_TOL;
         if(stepNo%20===0 && stepNo>=2) {
           bot.exTraj.push([stepNo,+state.position.x.toFixed(2),+state.position.y.toFixed(2),+state.position.z.toFixed(2),Math.round(state.speedKmh*10)/10]);
           const p=X.pm.get(stepNo);
@@ -1684,6 +1685,7 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
           if(cpi!==bot.exLastCp) {
             bot.exLastCp=cpi; bot.exCps[cpi]=stepNo;
             const bc=bot.exBestCps[cpi];
+            if(bc!==undefined && (bot.exCpLogs=(bot.exCpLogs||0)+1)<=400) console.log("PTBOT_OPT checkpoint "+cpi+": "+(stepNo<bc?(bc-stepNo)+" ms AHEAD of":(stepNo-bc)+" ms behind")+" the best run");
             if(bc!==undefined && stepNo>bc+150) exAbort("behind the best run at checkpoint "+cpi+" by "+(stepNo-bc)+" ms");
           }
           if(state.finishFrames===null && stepNo>bot.exBestT+10) exAbort("not going to beat "+(bot.exBestT/1000).toFixed(3)+" s");
@@ -2810,7 +2812,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.1.6";
+    this.modVersion="1.1.7";
     this.touchingPhysics=true;
   }
 
