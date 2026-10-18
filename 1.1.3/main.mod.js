@@ -1684,12 +1684,12 @@ console.log("PTBOT_CHECKPOINT_DIAG", {
           if(cpi!==bot.exLastCp) { bot.exLastCp=cpi; bot.exCps[cpi]=state.frames; }
         }
         if(!bot.exactOff) {
-          const fi=Math.min(X.n-1,stepNo);
+          const fi=Math.min(X.n-1,state.frames);
           const b=bits[fi];
           return {up:!!(b&1),right:!!(b&2),down:!!(b&4),left:!!(b&8),reset:!!(b&16)};
         }
       } else if(!bot.exactOff && bot.exAbort) {
-        const b=bits[Math.min(X.n-1,stepNo)];
+        const b=bits[Math.min(X.n-1,state.frames)];
         return {up:!!(b&1),right:!!(b&2),down:!!(b&4),left:!!(b&8),reset:false};
       }
     }
@@ -2787,7 +2787,7 @@ class TutorialBot extends PolyMod {
     this.modName="PolyTrack Tutorial Bot";
     this.modAuthor="Kn1ght-09";
     this.modID="polytrack-tutorial-bot";
-    this.modVersion="1.1.2";
+    this.modVersion="1.1.3";
     this.touchingPhysics=true;
   }
 
